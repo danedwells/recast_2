@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
+from sklearn.preprocessing import StandardScaler
 
 import eq
 import eq.distributions as dist
@@ -12,7 +13,9 @@ from eq.models.tpp_model import TPPModel
 
 
 class RecurrentTPP(TPPModel):
+
     """Neural TPP model with an recurrent encoder.
+    TPP = temporal point process
 
     Args:
         input_magnitude: Should magnitude be used as model input?
@@ -39,10 +42,18 @@ class RecurrentTPP(TPPModel):
         rnn_type: str = "GRU",
         dropout_proba: float = 0.5,
         tau_mean: float = 1.0,
+        x_mean: float = 0.0,
+        y_mean: float = 0.0,
+        x_std: float = 1.0,
+        y_std: float = 1.0,
         richter_b: float = 1.0,
         learning_rate: float = 5e-2,
+        *args,
+        **kwargs
     ):
         super().__init__()
+        self.debug = kwargs.get("debug", False)
+
         self.input_magnitude = input_magnitude
         self.predict_magnitude = predict_magnitude
         self.num_extra_features = num_extra_features
@@ -51,11 +62,37 @@ class RecurrentTPP(TPPModel):
         self.register_buffer("tau_mean", torch.tensor(tau_mean, dtype=torch.float64))
         self.register_buffer("log_tau_mean", self.tau_mean.log())
         self.register_buffer("richter_b", torch.tensor(richter_b, dtype=torch.float64))
+        
+        # Spatial encoding statistics (register as buffers like tau_mean)
+        self.register_buffer("x_mean", torch.tensor(x_mean, dtype=torch.float32))
+        self.register_buffer("x_std",  torch.tensor(x_std,  dtype=torch.float32))
+        self.register_buffer("y_mean", torch.tensor(y_mean, dtype=torch.float32))
+        self.register_buffer("y_std",  torch.tensor(y_std,  dtype=torch.float32))
+        
+        
         self.learning_rate = learning_rate
 
         # Decoder for the time distribution
         self.num_time_params = 3 * self.num_components
         self.hypernet_time = nn.Linear(context_size, self.num_time_params)
+
+        # Option 1
+        # Decoder for the spatial distribution - two hypernets, separates x and y
+        self.num_x_params = 3 * self.num_components  # mean, log_std, weight per component
+        self.num_y_params = 3 * self.num_components
+        self.hypernet_x = nn.Linear(context_size, self.num_x_params)
+        self.hypernet_y = nn.Linear(context_size, self.num_y_params)
+
+        # Option 2
+        # Decoder for the spatial distribution - combined with covariance.
+        self.num_xy_params = self.num_components * (
+            2          # mean vector (mu_x, mu_y)
+            + 2        # log-diagonal of L (l_11, l_22) — softplus'd to stay positive
+            + 1        # off-diagonal of L (l_21) — unconstrained
+            + 1        # mixture weight logit
+        )
+        self.hypernet_xy = nn.Linear(context_size, self.num_xy_params)
+        self.scale = StandardScaler()
 
         # RNN input features
         if self.input_magnitude:
@@ -67,12 +104,21 @@ class RecurrentTPP(TPPModel):
             raise ValueError(
                 f"rnn_type must be one of ['RNN', 'GRU', 'LSTM'] " f"(got {rnn_type})"
             )
-        self.num_rnn_inputs = (
+        """self.num_rnn_inputs = (
             1
             + int(self.input_magnitude)
             + (0 if self.num_extra_features is None else self.num_extra_features)
+        )"""
+
+        self.num_rnn_inputs = (
+            1                                        # time
+            + int(self.input_magnitude)              # magnitude
+            + 2                                      # x and y
+            + (0 if self.num_extra_features is None else self.num_extra_features)
         )
 
+        # Initialize the RNN model - this is a single layer, one of RNN GRU or LSTM
+        # TODO - investigate more complicated models?
         self.rnn = getattr(nn, rnn_type)(
             self.num_rnn_inputs,
             context_size,
@@ -85,7 +131,14 @@ class RecurrentTPP(TPPModel):
         # output has shape (..., 1)
         log_tau = torch.log(torch.clamp_min(inter_times, 1e-10)).unsqueeze(-1)
         return log_tau - self.log_tau_mean
-
+    
+    def encode_xy(self, x_loc, y_loc):
+        # x_loc, y_loc each have shape (...)
+        # output has shape (..., 2)
+        x_norm = (x_loc - self.x_mean) / self.x_std
+        y_norm = (y_loc - self.y_mean) / self.y_std
+        return torch.stack([x_norm, y_norm], dim=-1)
+    
     def encode_magnitude(self, mag, mag_completeness: Union[float, torch.tensor]):
         # mag has shape (...)
         # mag_completeness
@@ -109,15 +162,29 @@ class RecurrentTPP(TPPModel):
         Returns:
             context: Context vectors, shape (batch_size, seq_len, context_size)
         """
-        feat_list = [self.encode_time(batch.inter_times)]
+        # Get time
+        feat_list = [self.encode_time(batch.inter_times)] # Returns Log of inter-event times - minus the mean (continuously computed)
+        
+        # Get magnitude
         if self.input_magnitude:
             feat_list.append(self.encode_magnitude(batch.mag, batch.mag_bounds[:, 0]))
+        
+        # Get locations
+        feat_list.append(self.encode_xy(batch.x_loc, batch.y_loc))  # always included
+        
+        # Get anything additional
         if self.num_extra_features is not None:
             feat_list.append(self.encode_extra_features(batch.extra_feat))
         features = torch.cat(feat_list, dim=-1)
 
-        rnn_output = self.rnn(features)[0][:, :-1, :]
-        output = F.pad(rnn_output, (0, 0, 1, 0))  # (B, L, C)
+        # Temporary debug
+        if self.debug:
+            for i, f in enumerate(feat_list):
+                print(f"feat_list[{i}] dtype: {f.dtype}, shape: {f.shape}")
+    
+        # Rnn output is (output, h_n) or (output, (h_n,c_n))
+        rnn_output = self.rnn(features)[0][:, :-1, :] # Get hidden state, discard last entry for 2nd dim
+        output = F.pad(rnn_output, (0, 0, 1, 0))  # (B, L, C) # adds zero at the beginning
         return self.dropout(output)  # (B, L, C)
 
     def get_inter_time_dist(self, context):
@@ -130,11 +197,90 @@ class RecurrentTPP(TPPModel):
             [self.num_components, self.num_components, self.num_components],
             dim=-1,
         )
+        # How does this work? Not yet sure
         scale = F.softplus(scale.clamp_min(-5.0))
-        shape = F.softplus(shape.clamp_min(-5.0))
+        shape = F.softplus(shape.clamp_min(-5.0)) # Maybe higher min?
         weight_logits = F.log_softmax(weight_logits, dim=-1)
         component_dist = dist.Weibull(scale=scale, shape=shape)
         mixture_dist = Categorical(logits=weight_logits)
+        return dist.MixtureSameFamily(
+            mixture_distribution=mixture_dist,
+            component_distribution=component_dist,
+        )
+
+    def get_x_dist(self, context):
+        """Get the Gaussian mixture distribution over x-coordinates given the context."""
+        params = self.hypernet_x(context)
+        means, log_stds, weight_logits = torch.split(
+            params,
+            [self.num_components, self.num_components, self.num_components],
+            dim=-1,
+        )
+        # means are unbounded; stds must be positive
+        stds = F.softplus(log_stds.clamp_min(-5.0))
+        weight_logits = F.log_softmax(weight_logits, dim=-1)
+        component_dist = torch.distributions.Normal(loc=means, scale=stds)
+        mixture_dist = Categorical(logits=weight_logits)
+        return dist.MixtureSameFamily(
+            mixture_distribution=mixture_dist,
+            component_distribution=component_dist,
+        )
+
+    def get_y_dist(self, context):
+        """Get the Gaussian mixture distribution over y-coordinates given the context."""
+        params = self.hypernet_y(context)
+        means, log_stds, weight_logits = torch.split(
+            params,
+            [self.num_components, self.num_components, self.num_components],
+            dim=-1,
+        )
+        stds = F.softplus(log_stds.clamp_min(-5.0))
+        weight_logits = F.log_softmax(weight_logits, dim=-1)
+        component_dist = torch.distributions.Normal(loc=means, scale=stds)
+        mixture_dist = Categorical(logits=weight_logits)
+        return dist.MixtureSameFamily(
+            mixture_distribution=mixture_dist,
+            component_distribution=component_dist,
+        )
+    
+    def get_xy_dist(self, context):
+        """Get a 2D Gaussian mixture distribution over (x, y) given the context."""
+        params = self.hypernet_xy(context)  # (..., num_components * 6)
+        C = self.num_components
+
+        means, l_diag, l_offdiag, weight_logits = torch.split(
+            params, [2*C, 2*C, C, C], dim=-1
+        )
+
+        # means: (..., C, 2)
+        # Splits last dimension (-2) into (C,2), if before it had C*2
+        means = means.unflatten(-1, (C, 2))
+
+        # Build lower-triangular Cholesky factor L for each component
+        # l_diag entries must be positive → softplus
+        l_diag  = F.softplus(l_diag.clamp_min(-5.0))   # (..., 2*C)
+        l_diag  = l_diag.unflatten(-1, (C, 2))          # (..., C, 2)
+        l_offdiag = l_offdiag.unflatten(-1, (C, 1))     # (..., C, 1)
+
+        # Assemble L: shape (..., C, 2, 2)
+        *batch, c, _ = l_diag.shape # batch is all dimensions except last two
+        L = torch.zeros(*batch, c, 2, 2,  # spreads batch dimensions back out
+                        dtype=context.dtype, device=context.device)
+        L[..., 0, 0] = l_diag[..., 0]   # l_11
+        L[..., 1, 1] = l_diag[..., 1]   # l_22
+        L[..., 1, 0] = l_offdiag[..., 0] # l_21 (lower off-diagonal)
+
+        weight_logits = F.log_softmax(weight_logits, dim=-1)
+
+        component_dist = torch.distributions.MultivariateNormal(
+            loc=means,
+            scale_tril=L,   # accepts Cholesky directly — no need to form Σ explicitly
+        )
+
+        # We need a mixture distribution for the gaussians
+        mixture_dist = Categorical(logits=weight_logits)
+
+        # Combine the Gaussians 
         return dist.MixtureSameFamily(
             mixture_distribution=mixture_dist,
             component_distribution=component_dist,
@@ -157,25 +303,50 @@ class RecurrentTPP(TPPModel):
         Returns:
             nll: NLL of each sequence, shape (batch_size,)
         """
-        context = self.get_context(batch)  # (B, L, C)
+        context = self.get_context(batch)  # (B, L, C) Encodes everything, runs through rnn
         # Inter-event times
-        inter_time_dist = self.get_inter_time_dist(context)
-        log_pdf = inter_time_dist.log_prob(
+        inter_time_dist = self.get_inter_time_dist(context) # Get the weibull distributions
+        log_pdf = inter_time_dist.log_prob(  # Get negative log likelihood
             batch.inter_times.clamp_min(1e-10)
         )  # (B, L) # KDC: is this clamping twice?
         log_like = (log_pdf * batch.mask).sum(-1)
 
+
         # Survival time from last event until t_end
         arange = torch.arange(batch.batch_size)
+        
+        # 2D spatial term
+        xy = self.encode_xy(batch.x_loc, batch.y_loc)  # (B, L, 2)
+        xy_dist = self.get_xy_dist(context)
+        log_pdf_xy = xy_dist.log_prob(xy)              # (B, L)
+        spatial_term  = (log_pdf_xy * batch.mask).sum(-1)
+        spatial_weight = 0.1
+        log_like = log_like + spatial_weight*spatial_term
+
+
+        # LAST REAL EVENT - survival
+        # Go to last real event in each sequence (batch.end_idx). Get the context
         last_surv_context = context[arange, batch.end_idx, :]
+
+        # Get inter-event time
         last_surv_dist = self.get_inter_time_dist(last_surv_context)
+
+        # Get the log survival probability
         last_log_surv = last_surv_dist.log_survival(
             batch.inter_times[arange, batch.end_idx]
         )
         log_like = log_like + last_log_surv.squeeze(-1)  # (B,)
 
+                #  DEBUG
+        time_nll = -(log_pdf * batch.mask).sum(-1).mean()
+        xy_nll = -(log_pdf_xy * batch.mask).sum(-1).mean()
+        lls_nll = last_log_surv
+        print(f"Time NLL: {time_nll:.3f}, XY NLL: {xy_nll:.3f}")#, LLS : {lls_nll:.3f}")
+
+        # FIRST REAL EVENT - survival. Remove anything before.
         # Remove survival time from t_prev to t_nll_start
         if torch.any(batch.t_nll_start != batch.t_start):
+            # Get the context for each sequence at the start (start_idx)
             prev_surv_context = context[arange, batch.start_idx, :]
             prev_surv_dist = self.get_inter_time_dist(prev_surv_context)
             prev_surv_time = batch.inter_times[arange, batch.start_idx] - (
@@ -214,7 +385,6 @@ class RecurrentTPP(TPPModel):
             raise ValueError(
                 "Sampling is impossible if input_magnitude != predict_magnitude"
             )
-
         if self.num_extra_features is not None:
             raise ValueError("Sampling is not currently supported for extra features")
 
@@ -240,13 +410,16 @@ class RecurrentTPP(TPPModel):
                 if mag_completeness is not None
                 else None
             )
+
         if self.predict_magnitude and mag_threshold is None:
             raise ValueError("mag_completeness must be provided when sampling magnitudes")
         if mag_threshold is not None and mag_threshold.ndim == 0:
             mag_threshold = mag_threshold.expand(batch_size)
+
         t_end = t_start + duration
 
         inter_times = torch.empty(batch_size, 0, device=self.device)
+        locations = torch.empty(batch_size, 0, 2, device=self.device)  # (B, 0, 2)
         if self.predict_magnitude:
             magnitudes = torch.empty(batch_size, 0, device=self.device)
         else:
@@ -256,52 +429,63 @@ class RecurrentTPP(TPPModel):
         while not generated:
             inter_time_dist = self.get_inter_time_dist(current_state)
             if time_remaining is None:
-                next_inter_times = inter_time_dist.sample()  # (B, 1)
+                next_inter_times = inter_time_dist.sample()   # (B, 1)
             else:
                 next_inter_times = inter_time_dist.sample_conditional(
                     lower_bound=time_remaining
-                )  # (B, 1)
+                )
                 next_inter_times -= time_remaining
                 time_remaining = None
-            next_inter_times.clamp_max_(
-                t_end - t_start
-            )  # BUG: (?) creates samples of len 1 instead of zero
-            inter_times = torch.cat([inter_times, next_inter_times], dim=1)  # (B, L)
-            # Prepare RNN input
+            next_inter_times.clamp_max_(t_end - t_start)
+            inter_times = torch.cat([inter_times, next_inter_times], dim=1)
+
             rnn_input_list = [self.encode_time(next_inter_times)]
 
             if self.predict_magnitude:
                 mag_dist = self.get_magnitude_dist(current_state, mag_threshold)
-                next_mag = (
-                    mag_dist.sample()
-                )  # (B, 1)                                  # FLAG
+                next_mag = mag_dist.sample()                  # (B, 1)
                 next_mag = next_mag.clamp_min_(mag_threshold.unsqueeze(1))
-                magnitudes = torch.cat([magnitudes, next_mag], dim=1)  # (B, L)
-                rnn_input_list.append(
-                    self.encode_magnitude(next_mag, mag_threshold)
-                )  # FLAG
+                magnitudes = torch.cat([magnitudes, next_mag], dim=1)
+                rnn_input_list.append(self.encode_magnitude(next_mag, mag_threshold))
+
+            # Sample spatial locations and feed back into RNN
+            xy_dist = self.get_xy_dist(current_state)
+            next_xy = xy_dist.sample()                        # (B, 1, 2)
+            locations = torch.cat([locations, next_xy], dim=1)
+            next_x = next_xy[..., 0]                          # (B, 1)
+            next_y = next_xy[..., 1]                          # (B, 1)
+            rnn_input_list.append(self.encode_xy(next_x, next_y))  # (B, 1, 2)
 
             with torch.no_grad():
                 reached = inter_times.sum(-1).min()
                 generated = reached >= t_end - t_start
                 rnn_input = torch.cat(rnn_input_list, dim=-1)
+
             current_state = self.rnn(
                 rnn_input, current_state.transpose(0, 1).contiguous()
             )[0]
-            current_state = self.dropout(current_state)  # (B, 1, C)
+            current_state = self.dropout(current_state)       # (B, 1, C)
 
         duration = t_end - t_start
-        unclipped_arrival_times = inter_times.cumsum(-1)  # (B, L)
-        padding_mask = (
-            unclipped_arrival_times >= duration
-        )  # BUG: ATTEMPTED FIX (> to >=) - clipped values should be masked out
+        unclipped_arrival_times = inter_times.cumsum(-1)
+        padding_mask = unclipped_arrival_times >= duration
         inter_times = torch.masked_fill(inter_times, padding_mask, 0.0)
         end_idx = (1 - padding_mask.long()).sum(-1)
         last_surv_time = duration - inter_times.sum(-1)
         inter_times[torch.arange(batch_size), end_idx] = last_surv_time
+
+        """
+        print("t_start type:", type(t_start), t_start)
+        print("inter_times dtype:", inter_times.dtype)
+        print("cumsum:", inter_times.cumsum(-1)[0, :5])
+        print("cumsum + t_start:", (inter_times.cumsum(-1) + t_start)[0, :5])
+        print("arrival_times[0, :5] inside sample:", inter_times.cumsum(-1) + t_start)  # ← add t_start
+        print("t_start inside sample:", t_start)
+        """
+
         batch = eq.data.Batch(
             inter_times=inter_times,
-            arrival_times=inter_times.cumsum(-1),
+            arrival_times=inter_times.cumsum(-1) + t_start,  # ← add t_start
             t_start=torch.full([batch_size], t_start, device=self.device).float(),
             t_end=torch.full([batch_size], t_end, device=self.device).float(),
             t_nll_start=torch.full([batch_size], t_start, device=self.device).float(),
@@ -309,6 +493,8 @@ class RecurrentTPP(TPPModel):
             start_idx=torch.zeros(batch_size, device=self.device).long(),
             end_idx=end_idx,
             mag=magnitudes,
+            x_loc=locations[..., 0],
+            y_loc=locations[..., 1],
         )
         if return_sequences:
             return batch.to_list()

@@ -71,7 +71,7 @@ class Sequence(DotDict):
     """Sequence of events (potentially with marks).
 
     Args:
-        inter_times: Inter-event times, including the last survival time t_end - t_N.
+        inter_times: Inter-event times, inc     luding the last survival time t_end - t_N.
             shape [num_events + 1]
         t_start: Start of the observed time interval.
         t_nll_start: The negative log-likelihood (NLL) will be evaluated on the interval
@@ -108,6 +108,8 @@ class Sequence(DotDict):
     def __init__(
         self,
         inter_times: Union[torch.Tensor, np.ndarray, list],
+        #x_loc: Union[torch.Tensor, np.ndarray, list] = [],
+        #y_loc: Union[torch.Tensor, np.ndarray, list] = [],
         t_start: float = 0.0,
         t_nll_start: Optional[float] = None,
         **kwargs,
@@ -120,20 +122,25 @@ class Sequence(DotDict):
             raise ValueError(
                 f"inter_times must be of type torch.float32 or torch.float64 (got {self.inter_times.dtype})"
             )
+        
 
         self.t_start = float(t_start)
         self.t_end = float(self.inter_times.sum().item() + self.t_start)
         if t_nll_start is None:
             t_nll_start = t_start
         self.t_nll_start = float(t_nll_start)
-
+        
+        # TODO - investigate if this messes up the float64 with times
         for key, value in kwargs.items():
             if isinstance(value, ContinuousMarks):
-                self[key] = torch.as_tensor(value.values)
-                self[key + "_bounds"] = torch.as_tensor(value.bounds)
-                self[key + "_nll_bounds"] = torch.as_tensor(value.nll_bounds)
+                self[key] = torch.as_tensor(value.values, dtype=torch.float32)        # ← add dtype
+                self[key + "_bounds"] = torch.as_tensor(value.bounds, dtype=torch.float32)
+                self[key + "_nll_bounds"] = torch.as_tensor(value.nll_bounds, dtype=torch.float32)
             else:
-                self[key] = torch.as_tensor(value)
+                self[key] = torch.as_tensor(value, dtype=torch.float32) 
+
+        #self.x_loc = torch.as_tensor(self['x_loc'].values,dtyp
+        #self.y_loc = self['y_loc'].values
 
         self._validate_args()
         # Move all tensors to the same device as inter_times
@@ -150,7 +157,30 @@ class Sequence(DotDict):
         return self.arrival_times64.to(
             self.inter_times.device, dtype=self.inter_times.dtype
         )
+    
+    """
+    @property
+    def locations_x64(self):
+        # Operate on the raw stored tensor, not via self.locations
+        return self.x_loc.to("cpu", dtype=torch.float64)
 
+    @property
+    def locations_x(self):
+        return self.locations_x64.to(
+            self.locations_x.device, dtype=self.inter_times.dtype
+        )
+    
+    @property
+    def locations_y64(self):
+        # Operate on the raw stored tensor, not via self.locations
+        return self.y_loc.to("cpu", dtype=torch.float64)
+
+    @property
+    def locations_y(self):
+        return self.locations_y64.to(
+            self.locations_y.device, dtype=self.inter_times.dtype
+        )
+    """
     @property
     def num_events(self):
         return len(self.arrival_times)

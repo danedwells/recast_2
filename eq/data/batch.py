@@ -78,12 +78,14 @@ class Batch(DotDict):
         start_idx = get_start_idx(arrival_times, t_nll_start)
         mask = get_mask(inter_times, start_idx, end_idx)
 
+
         # Handle other attributes (e.g., marks, locations) 
         other_attr_names = [
             k
             for k in sequences[0].keys()
             if k not in sequences[0].default_sequence_attrs and 'bounds' not in k
         ]
+        #print(other_attr_names)
         other_attr = {}
         for name in other_attr_names:
             values = [seq[name] for seq in sequences]
@@ -104,7 +106,7 @@ class Batch(DotDict):
             for i, seq in enumerate(sequences):
                 other_bounds[k][i,:] = seq[k]
         
-
+        print("Inter_times: ",inter_times)
         return Batch(
             inter_times=inter_times,
             arrival_times=arrival_times,
