@@ -13,11 +13,16 @@ end_time = 10
 mag = [1, 2, 3]
 mag_bounds = [0, 10]
 mag_nll_bounds = [0, 10]
+x_loc = [0,1,2]
+y_loc = [0,0,0]
 mag = eq.data.ContinuousMarks(
     values=torch.tensor(mag, dtype=torch.float32),
     bounds=torch.tensor(mag_bounds, dtype=torch.float32),
     nll_bounds=torch.tensor(mag_nll_bounds, dtype=torch.float32),
+    
 )
+x_loc = eq.data.ContinuousMarks(x_loc, bounds=[-5,5], nll_bounds=[-4,4])
+y_loc = eq.data.ContinuousMarks(y_loc, bounds=[-5,5], nll_bounds=[-4,4])
 inter_times = np.diff(times, prepend=[start_time], append=[end_time])
 seq1 = eq.data.Sequence(
     inter_times=torch.tensor(inter_times, dtype=torch.float32), 
@@ -25,17 +30,24 @@ seq1 = eq.data.Sequence(
     t_start=start_time, 
     t_end=end_time,
     t_nll_start=start_time,
+    x_loc = x_loc,
+    y_loc = y_loc
 )
 
 times = [1, 2, 4, 7]
 mag = [4, 0, 6, -1]
 mag_bounds = [-2, 10]
 mag_nll_bounds = [0, 10]
+x_loc = [-1,-1,-1,-1]
+y_loc = [-1,0,2,3]
 mag = eq.data.ContinuousMarks(
     values=torch.tensor(mag, dtype=torch.float32),
     bounds=torch.tensor(mag_bounds, dtype=torch.float32),
     nll_bounds=torch.tensor(mag_nll_bounds, dtype=torch.float32),
+
 )
+x_loc = eq.data.ContinuousMarks(x_loc, bounds=[-5,5], nll_bounds=[-4,4])
+y_loc = eq.data.ContinuousMarks(y_loc, bounds=[-5,5], nll_bounds=[-4,4])
 start_time = 0
 end_time = 20   
 inter_times = np.diff(times, prepend=[start_time], append=[end_time])
@@ -45,6 +57,8 @@ seq2 = eq.data.Sequence(
     t_start=start_time, 
     t_end=end_time,
     t_nll_start=start_time+2.5,
+    x_loc = x_loc,
+    y_loc = y_loc
 )
 
 batch = eq.data.Batch.from_list([seq1, seq2])

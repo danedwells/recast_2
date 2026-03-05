@@ -38,7 +38,8 @@ class RecurrentTPP(TPPModel):
         predict_magnitude: bool = True,
         num_extra_features: Optional[int] = None,
         context_size: int = 32,
-        num_components: int = 32,
+        num_components_time: int = 32,
+        num_components_space: int = 32,
         rnn_type: str = "GRU",
         dropout_proba: float = 0.5,
         tau_mean: float = 1.0,
@@ -58,7 +59,8 @@ class RecurrentTPP(TPPModel):
         self.predict_magnitude = predict_magnitude
         self.num_extra_features = num_extra_features
         self.context_size = context_size
-        self.num_components = num_components
+        self.num_components_time = num_components_time
+        self.num_components_space = num_components_space
         self.register_buffer("tau_mean", torch.tensor(tau_mean, dtype=torch.float64))
         self.register_buffer("log_tau_mean", self.tau_mean.log())
         self.register_buffer("richter_b", torch.tensor(richter_b, dtype=torch.float64))
@@ -73,19 +75,19 @@ class RecurrentTPP(TPPModel):
         self.learning_rate = learning_rate
 
         # Decoder for the time distribution
-        self.num_time_params = 3 * self.num_components
+        self.num_time_params = 3 * self.num_components_time
         self.hypernet_time = nn.Linear(context_size, self.num_time_params)
 
         # Option 1
         # Decoder for the spatial distribution - two hypernets, separates x and y
-        self.num_x_params = 3 * self.num_components  # mean, log_std, weight per component
-        self.num_y_params = 3 * self.num_components
+        self.num_x_params = 3 * self.num_components_space  # mean, log_std, weight per component
+        self.num_y_params = 3 * self.num_components_space
         self.hypernet_x = nn.Linear(context_size, self.num_x_params)
         self.hypernet_y = nn.Linear(context_size, self.num_y_params)
 
         # Option 2
         # Decoder for the spatial distribution - combined with covariance.
-        self.num_xy_params = self.num_components * (
+        self.num_xy_params = self.num_components_space * (
             2          # mean vector (mu_x, mu_y)
             + 2        # log-diagonal of L (l_11, l_22) — softplus'd to stay positive
             + 1        # off-diagonal of L (l_21) — unconstrained
@@ -96,7 +98,7 @@ class RecurrentTPP(TPPModel):
 
         # RNN input features
         if self.input_magnitude:
-            # Decoder for magnitude
+            # Decoder for 
             self.num_mag_params = 1  # (1 rate)
             self.hypernet_mag = nn.Linear(context_size, self.num_mag_params)
 
@@ -156,7 +158,7 @@ class RecurrentTPP(TPPModel):
         # output has shape (..., num_extra_features)
         return extra_feat
 
-    def get_context(self, batch):
+    def get_context(self, batch, return_hidden = False):
         """Get context embedding for each event in the batch of padded sequences.
 
         Returns:
@@ -183,8 +185,13 @@ class RecurrentTPP(TPPModel):
                 print(f"feat_list[{i}] dtype: {f.dtype}, shape: {f.shape}")
     
         # Rnn output is (output, h_n) or (output, (h_n,c_n))
-        rnn_output = self.rnn(features)[0][:, :-1, :] # Get hidden state, discard last entry for 2nd dim
+        rnn_out = self.rnn(features) # Get hidden state, discard last entry for 2nd dim
+        rnn_output = rnn_out[0][:,:-1,:]
+        hidden = rnn_out[1]
         output = F.pad(rnn_output, (0, 0, 1, 0))  # (B, L, C) # adds zero at the beginning
+        if return_hidden == True:
+            return self.dropout(output), hidden
+        
         return self.dropout(output)  # (B, L, C)
 
     def get_inter_time_dist(self, context):
@@ -194,7 +201,7 @@ class RecurrentTPP(TPPModel):
         # params = clamp_preserve_gradients(params, -6.0, np.inf)
         scale, shape, weight_logits = torch.split(
             params,
-            [self.num_components, self.num_components, self.num_components],
+            [self.num_components_time, self.num_components_time, self.num_components_time],
             dim=-1,
         )
         # How does this work? Not yet sure
@@ -213,7 +220,7 @@ class RecurrentTPP(TPPModel):
         params = self.hypernet_x(context)
         means, log_stds, weight_logits = torch.split(
             params,
-            [self.num_components, self.num_components, self.num_components],
+            [self.num_components_space, self.num_components_space, self.num_components_space],
             dim=-1,
         )
         # means are unbounded; stds must be positive
@@ -231,7 +238,7 @@ class RecurrentTPP(TPPModel):
         params = self.hypernet_y(context)
         means, log_stds, weight_logits = torch.split(
             params,
-            [self.num_components, self.num_components, self.num_components],
+            [self.num_components_space, self.num_components_space, self.num_components_space],
             dim=-1,
         )
         stds = F.softplus(log_stds.clamp_min(-5.0))
@@ -246,7 +253,7 @@ class RecurrentTPP(TPPModel):
     def get_xy_dist(self, context):
         """Get a 2D Gaussian mixture distribution over (x, y) given the context."""
         params = self.hypernet_xy(context)  # (..., num_components * 6)
-        C = self.num_components
+        C = self.num_components_space
 
         means, l_diag, l_offdiag, weight_logits = torch.split(
             params, [2*C, 2*C, C, C], dim=-1
@@ -337,7 +344,7 @@ class RecurrentTPP(TPPModel):
         )
         log_like = log_like + last_log_surv.squeeze(-1)  # (B,)
 
-                #  DEBUG
+        #  DEBUG
         time_nll = -(log_pdf * batch.mask).sum(-1).mean()
         xy_nll = -(log_pdf_xy * batch.mask).sum(-1).mean()
         lls_nll = last_log_surv
@@ -397,7 +404,10 @@ class RecurrentTPP(TPPModel):
                 )
             else:
                 mag_threshold = past_seq.mag_bounds[0].to(self.device)
-            current_state = self.get_context(past_batch)[:, [-1], :]  # (1, 1, C)
+            past_context, h_n = self.get_context(past_batch,
+                                                 return_hidden=True) # (1, 1, C)
+            assert past_context.shape[-1] == h_n.shape[-1]
+            current_state = past_context[:, [-1], :] 
             current_state = current_state.expand(batch_size, -1, -1)  # (B, 1, C)
             time_remaining = past_seq.t_end - past_seq.arrival_times[-1]
         else:
