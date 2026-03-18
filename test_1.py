@@ -132,15 +132,15 @@ save_dir = "test_1"
 Training Loop
 """
 
-_RETRAIN_ = False
+_RETRAIN_ = True
 
 if _RETRAIN_:
-    epochs = 500
+    epochs = 5000
 
     running_training_loss = []
 
     # TODO - consider separate space and time optimizers
-    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=3e-3)
     scheduler = CosineAnnealingLR(optimizer, T_max = epochs)
 
     device = 'cuda' if torch.cuda.is_available else 'cpu'
