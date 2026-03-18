@@ -142,6 +142,10 @@ class RecurrentTPP(TPPModel):
         return torch.stack([x_norm, y_norm], dim=-1)
     
     def encode_magnitude(self, mag, mag_completeness: Union[float, torch.tensor]):
+        # Subtracts magnitude of completeness from the magnitudes 
+        # This means each has an 'effective' magnitude of completeness of 0,
+        # and that the magnitude of every other earthquake has beeen reduced
+        # by the same amount.
         # mag has shape (...)
         # mag_completeness
         # output has shape (..., 1)
@@ -348,7 +352,7 @@ class RecurrentTPP(TPPModel):
         time_nll = -(log_pdf * batch.mask).sum(-1).mean()
         xy_nll = -(log_pdf_xy * batch.mask).sum(-1).mean()
         lls_nll = last_log_surv
-        print(f"Time NLL: {time_nll:.3f}, XY NLL: {xy_nll:.3f}")#, LLS : {lls_nll:.3f}")
+        #print(f"Time NLL: {time_nll:.3f}, XY NLL: {xy_nll:.3f}")#, LLS : {lls_nll:.3f}")
 
         # FIRST REAL EVENT - survival. Remove anything before.
         # Remove survival time from t_prev to t_nll_start
@@ -466,6 +470,7 @@ class RecurrentTPP(TPPModel):
             next_y = next_xy[..., 1]                          # (B, 1)
             rnn_input_list.append(self.encode_xy(next_x, next_y))  # (B, 1, 2)
 
+            # RNN_input now has [inter_time, magnitude, and (x,y)]
             with torch.no_grad():
                 reached = inter_times.sum(-1).min()
                 generated = reached >= t_end - t_start
