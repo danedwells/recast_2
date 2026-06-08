@@ -33,6 +33,9 @@ class Weibull(Distribution):
         return torch.exp(log_lmbd + torch.lgamma(1 + self.shape.reciprocal()))
 
     def rsample(self, sample_shape=torch.Size()):
+        """
+        Sample from PDF 
+        """
         shape = torch.Size(sample_shape) + self.batch_shape
         z = torch.empty(
             shape, device=self.scale.device, dtype=self.scale.dtype
@@ -41,12 +44,13 @@ class Weibull(Distribution):
         return samples
 
     def sample_conditional(self, lower_bound, sample_shape=torch.Size()):
+        """
+        Sample from PDF only above lower_bound
+        """
         shape = torch.Size(sample_shape) + self.batch_shape
         u = torch.empty(
             shape, device=self.scale.device, dtype=self.scale.dtype
         ).uniform_()
         survival = self.log_survival(lower_bound).exp()
         u = u * survival
-        return (-u.log() * self.scale.reciprocal() + self.eps).pow(
-            self.shape.reciprocal()
-        )
+        return (-u.log() * self.scale.reciprocal() + self.eps).pow(self.shape.reciprocal())
