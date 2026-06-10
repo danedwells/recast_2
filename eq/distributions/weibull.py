@@ -17,10 +17,13 @@ class Weibull(Distribution):
         super().__init__(batch_shape, validate_args=validate_args)
 
     def log_hazard(self, x):
+        # The hazard function h(x) is defined as h(x) = p(x) / S(x), w
         x = torch.clamp_min(x, self.eps)  # ensure x > 0 for numerical stability
         return self.scale.log() + self.shape.log() + (self.shape - 1) * x.log()
 
     def log_survival(self, x):
+        # The survival function S(x) corresponds to Pr(X >= x) and can be computed as
+        # S(x) = \int_{0}^{x} p(u) du, where p(x) is the PDF.
         x = torch.clamp_min(x, self.eps)  # ensure x > 0 for numerical stability
         return self.scale.neg() * torch.pow(x, self.shape)
 
