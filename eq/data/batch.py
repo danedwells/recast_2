@@ -106,7 +106,6 @@ class Batch(DotDict):
             for i, seq in enumerate(sequences):
                 other_bounds[k][i,:] = seq[k]
         
-        print("Inter_times: ",inter_times)
         return Batch(
             inter_times=inter_times,
             arrival_times=arrival_times,

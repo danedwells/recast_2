@@ -30,7 +30,7 @@ class InMemoryDataset(torch.utils.data.Dataset):
 
     @staticmethod
     def load_from_disk(path: Union[str, Path]) -> "InMemoryDataset":
-        data = torch.load(path)
+        data = torch.load(path, weights_only=False)
         sequences = [Sequence(**seq) for seq in data]
         return InMemoryDataset(sequences=sequences)
 

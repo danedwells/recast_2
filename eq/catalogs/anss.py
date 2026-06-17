@@ -282,6 +282,15 @@ class ANSS_MultiCatalog(Catalog):
 
             local_df = local_df.sort_values("time", ascending=[True])
 
+            event_lat = float(event["lat"].iloc[0])
+            event_lon = float(event["lon"].iloc[0])
+            km_per_deg_lat = 111.1
+            km_per_deg_lon = km_per_deg_lat * np.cos(np.radians(event_lat))
+            # Wrap longitude difference to [-180, 180] to handle antimeridian crossings
+            delta_lon = (local_df.lon.values - event_lon + 180) % 360 - 180
+            x_km = (delta_lon * km_per_deg_lon).astype(np.float32)
+            y_km = ((local_df.lat.values - event_lat) * km_per_deg_lat).astype(np.float32)
+
             arrival_times = (
                 (local_df.time - global_start_time) / pd.Timedelta("1 day")
             ).values
@@ -315,6 +324,8 @@ class ANSS_MultiCatalog(Catalog):
                     lon=torch.as_tensor(local_df.lon.values, dtype=torch.float32),
                     depth=torch.as_tensor(local_df.depth.values, dtype=torch.float32),
                     distance_km=torch.as_tensor(local_df.distance_km.values, dtype=torch.float32),
+                    x_loc=torch.as_tensor(x_km, dtype=torch.float32),
+                    y_loc=torch.as_tensor(y_km, dtype=torch.float32),
                 )
             )
 

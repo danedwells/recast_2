@@ -80,10 +80,10 @@ class RecurrentTPP(TPPModel):
 
         # Option 1
         # Decoder for the spatial distribution - two hypernets, separates x and y
-        self.num_x_params = 3 * self.num_components_space  # mean, log_std, weight per component
-        self.num_y_params = 3 * self.num_components_space
-        self.hypernet_x = nn.Linear(context_size, self.num_x_params)
-        self.hypernet_y = nn.Linear(context_size, self.num_y_params)
+        # self.num_x_params = 3 * self.num_components_space  # mean, log_std, weight per component
+        # self.num_y_params = 3 * self.num_components_space
+        # self.hypernet_x = nn.Linear(context_size, self.num_x_params)
+        # self.hypernet_y = nn.Linear(context_size, self.num_y_params)
 
         # Option 2
         # Decoder for the spatial distribution - combined with covariance.
@@ -93,7 +93,12 @@ class RecurrentTPP(TPPModel):
             + 1        # off-diagonal of L (l_21) — unconstrained
             + 1        # mixture weight logit
         )
-        self.hypernet_xy = nn.Linear(context_size, self.num_xy_params)
+        # Option B — joint spatio-temporal distribution: p(τ,x,y|c) = p(τ|c)·p(x,y|τ,c).
+        # Spatial decoder now takes context + encoded τ so the mixture means/covariances
+        # can vary with inter-event time, capturing aftershock clustering (small τ → near
+        # source, large τ → diffuse background).  Revert by restoring context_size below.
+        # self.hypernet_xy = nn.Linear(context_size, self.num_xy_params)
+        self.hypernet_xy = nn.Linear(context_size + 1, self.num_xy_params)
         self.scale = StandardScaler()
 
         # RNN input features
@@ -219,44 +224,18 @@ class RecurrentTPP(TPPModel):
             component_distribution=component_dist,
         )
 
-    def get_x_dist(self, context):
-        """Get the Gaussian mixture distribution over x-coordinates given the context."""
-        params = self.hypernet_x(context)
-        means, log_stds, weight_logits = torch.split(
-            params,
-            [self.num_components_space, self.num_components_space, self.num_components_space],
-            dim=-1,
-        )
-        # means are unbounded; stds must be positive
-        stds = F.softplus(log_stds.clamp_min(-5.0))
-        weight_logits = F.log_softmax(weight_logits, dim=-1)
-        component_dist = torch.distributions.Normal(loc=means, scale=stds)
-        mixture_dist = Categorical(logits=weight_logits)
-        return dist.MixtureSameFamily(
-            mixture_distribution=mixture_dist,
-            component_distribution=component_dist,
-        )
+    def get_xy_dist(self, context, inter_times):
+        """Get a 2D Gaussian mixture distribution over (x, y) given context and τ.
 
-    def get_y_dist(self, context):
-        """Get the Gaussian mixture distribution over y-coordinates given the context."""
-        params = self.hypernet_y(context)
-        means, log_stds, weight_logits = torch.split(
-            params,
-            [self.num_components_space, self.num_components_space, self.num_components_space],
-            dim=-1,
-        )
-        stds = F.softplus(log_stds.clamp_min(-5.0))
-        weight_logits = F.log_softmax(weight_logits, dim=-1)
-        component_dist = torch.distributions.Normal(loc=means, scale=stds)
-        mixture_dist = Categorical(logits=weight_logits)
-        return dist.MixtureSameFamily(
-            mixture_distribution=mixture_dist,
-            component_distribution=component_dist,
-        )
-    
-    def get_xy_dist(self, context):
-        """Get a 2D Gaussian mixture distribution over (x, y) given the context."""
-        params = self.hypernet_xy(context)  # (..., num_components * 6)
+        Option B: p(x,y | τ, c) — spatial parameters conditioned on inter-event time
+        so that aftershock proximity and background diffusion emerge from the same decoder.
+        inter_times must broadcast against context's leading dimensions.
+        """
+        # Option B: concatenate encoded τ to context before decoding spatial params.
+        # Revert by removing the cat and passing context directly to hypernet_xy.
+        tau_encoded = self.encode_time(inter_times)          # (..., 1)
+        context_tau = torch.cat([context, tau_encoded], dim=-1)  # (..., C+1)
+        params = self.hypernet_xy(context_tau)  # (..., num_components * 6)
         C = self.num_components_space
 
         means, l_diag, l_offdiag, weight_logits = torch.split(
@@ -326,9 +305,10 @@ class RecurrentTPP(TPPModel):
         # Survival time from last event until t_end
         arange = torch.arange(batch.batch_size)
         
-        # 2D spatial term
+        # 2D spatial term — Option B: condition spatial dist on observed τ at each event
         xy = self.encode_xy(batch.x_loc, batch.y_loc)  # (B, L, 2)
-        xy_dist = self.get_xy_dist(context)
+        # xy_dist = self.get_xy_dist(context)          # old: p(x,y|c) independent of τ
+        xy_dist = self.get_xy_dist(context, batch.inter_times)  # new: p(x,y|τ,c)
         log_pdf_xy = xy_dist.log_prob(xy)              # (B, L)
         spatial_term  = (log_pdf_xy * batch.mask).sum(-1)
         spatial_weight = 0.1
@@ -463,7 +443,8 @@ class RecurrentTPP(TPPModel):
                 rnn_input_list.append(self.encode_magnitude(next_mag, mag_threshold))
 
             # Sample spatial locations and feed back into RNN
-            xy_dist = self.get_xy_dist(current_state)
+            # xy_dist = self.get_xy_dist(current_state)      # old: p(x,y|c)
+            xy_dist = self.get_xy_dist(current_state, next_inter_times)  # new: p(x,y|τ,c)
             next_xy = xy_dist.sample()                        # (B, 1, 2)
             locations = torch.cat([locations, next_xy], dim=1)
             next_x = next_xy[..., 0]                          # (B, 1)
@@ -535,6 +516,53 @@ class RecurrentTPP(TPPModel):
         grid = (x + offsets).T.reshape(-1)
         return grid, intensity
 
+    def evaluate_spatial_intensity(
+        self,
+        sequence: eq.data.Sequence,
+        grid_x: torch.Tensor,
+        grid_y: torch.Tensor,
+        tau: float,
+    ) -> torch.Tensor:
+        """Evaluate the forecast spatial intensity over a 2D grid at a given τ.
+
+        Computes p(x, y | τ, all observed events) at each grid point under
+        Option B, where the spatial distribution is conditioned on inter-event
+        time τ = t_query - t_last_event.  Density is returned in geographic
+        coordinate units, accounting for the Jacobian of the normalization.
+
+        Args:
+            sequence: Observed history.
+            grid_x:   2-D tensor of x-coordinates (e.g. longitude), shape (H, W).
+            grid_y:   2-D tensor of y-coordinates (e.g. latitude),  shape (H, W).
+            tau:      Time since the last observed event (same units as sequence).
+
+        Returns:
+            density:  Probability density at each grid point, shape (H, W).
+        """
+        batch = eq.data.Batch.from_list([sequence])
+        context = self.get_context(batch).squeeze(0)  # (L, C)
+
+        # context[-1] is conditioned on all observed events — same pattern as
+        # sample(), which uses past_context[:, -1, :] as its forecast starting state.
+        forecast_context = context[-1]  # (C,)
+
+        tau_tensor = torch.tensor(tau, dtype=forecast_context.dtype,
+                                  device=forecast_context.device)
+        # old: xy_dist = self.get_xy_dist(forecast_context)
+        xy_dist = self.get_xy_dist(forecast_context, tau_tensor)  # p(x,y|τ,c)
+
+        # Normalise grid coordinates to match the space the mixture was decoded in
+        x_norm = (grid_x - self.x_mean) / self.x_std  # (H, W)
+        y_norm = (grid_y - self.y_mean) / self.y_std  # (H, W)
+        xy_norm = torch.stack([x_norm, y_norm], dim=-1)  # (H, W, 2)
+
+        log_p_norm = xy_dist.log_prob(xy_norm)  # (H, W)
+
+        # Convert density from normalised space to geographic space:
+        # p(x,y) = p(z) * |dz/dx| = p(z) / (σ_x * σ_y)
+        log_jacobian = -(self.x_std.log() + self.y_std.log())
+        return (log_p_norm + log_jacobian).exp()  # (H, W)
+
     def evaluate_compensator(
         self, sequence: eq.data.Sequence, num_grid_points: int = 50
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -560,3 +588,62 @@ class RecurrentTPP(TPPModel):
         offsets = torch.cat([torch.tensor([0.0]), sequence.arrival_times])
         grid = (x + offsets).T.reshape(-1)
         return grid, compensator
+    
+    def evaluate_conditional_intensity(
+        self,
+        sequence: eq.data.Sequence,
+        t_grid: torch.Tensor,
+        x_grid: torch.Tensor,
+        y_grid: torch.Tensor,
+    ) -> torch.Tensor:
+        """Evaluate the joint spatio-temporal conditional intensity on a grid.
+
+        Combines evaluate_intensity() and evaluate_spatial_intensity() via the
+        standard factorization of the conditional intensity into a temporal
+        hazard rate and a spatial density given time:
+
+            λ(t, r | H) = f(t | c) / (1 - F(t | c))  ×  g(r | t, c)
+                        = hazard(t | c)  ×  g(r | t, c)
+
+        where c is the context summarizing the observed history H (taken
+        after the last observed event, as in evaluate_spatial_intensity),
+        t is elapsed time since that last event, and r = (x, y) is location.
+        Because the spatial decoder is conditioned on τ (Option B), g(r|t,c)
+        is re-evaluated for every t in t_grid.
+
+        Args:
+            sequence: Observed history H.
+            t_grid: 1-D tensor of times since the last observed event, shape (T,).
+            x_grid: 2-D tensor of x-coordinates, shape (R, C).
+            y_grid: 2-D tensor of y-coordinates, shape (R, C).
+
+        Returns:
+            intensity: λ(t, r | H) evaluated at each (t, x, y), shape (T, R, C).
+        """
+        batch = eq.data.Batch.from_list([sequence])
+        context = self.get_context(batch).squeeze(0)  # (L, C)
+        forecast_context = context[-1]  # (C,) — condition on the full observed history
+
+        t_grid = t_grid.to(dtype=forecast_context.dtype, device=forecast_context.device)
+
+        # Temporal hazard rate: f(t|c) / (1 - F(t|c))
+        inter_time_dist = self.get_inter_time_dist(forecast_context)
+        hazard = inter_time_dist.log_hazard(t_grid).exp()  # (T,)
+
+        # Normalize the spatial grid once, matching the space the mixture decodes in
+        x_norm = (x_grid - self.x_mean) / self.x_std  # (R, C)
+        y_norm = (y_grid - self.y_mean) / self.y_std
+        xy_norm = torch.stack([x_norm, y_norm], dim=-1)  # (R, C, 2)
+        log_jacobian = -(self.x_std.log() + self.y_std.log())
+
+        # g(r|t,c) depends on t (Option B), so re-decode the spatial mixture per t
+        intensity = torch.empty(
+            t_grid.shape[0], *x_grid.shape,
+            dtype=forecast_context.dtype, device=forecast_context.device,
+        )
+        for i, t in enumerate(t_grid):
+            xy_dist = self.get_xy_dist(forecast_context, t)   # g(r|t,c)
+            log_g = xy_dist.log_prob(xy_norm) + log_jacobian  # (R, C)
+            intensity[i] = hazard[i] * log_g.exp()
+
+        return intensity

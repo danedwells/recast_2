@@ -18,7 +18,7 @@ class Catalog:
         self.root_dir = Path(root_dir).expanduser().resolve()
         self.metadata = metadata
         if self.root_dir.exists():
-            existing_metadata = torch.load(self.root_dir / "metadata.pt")
+            existing_metadata = torch.load(self.root_dir / "metadata.pt", weights_only=False)
             # Check if the saved dataset is what we requested
             if existing_metadata == self.metadata and self.all_paths_exist():
                 print(f"Loading existing catalog from {self.root_dir}.")

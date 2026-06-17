@@ -13,13 +13,22 @@ from matplotlib.patches import Ellipse
 # Plot Gaussian distributions fitted to data
 ########################################
 """
-def plot_xy_mixture(model, context_vec, ax, n_std=2.0, alpha=0.3):
+def plot_xy_mixture(model, context_vec, ax, n_std=2.0, alpha=0.3, tau=None):
     """
     Plot 2D Gaussian mixture components as ellipses.
     context_vec: single context vector, shape (1, 1, context_size)
+    tau: inter-event time for spatial conditioning (None uses tau_mean → zero encoding)
     """
     with torch.no_grad():
-        params = model.hypernet_xy(context_vec)
+        # hypernet_xy takes [context, encode_time(tau)]; default tau=tau_mean gives 0 encoding
+        if tau is None:
+            tau_enc = torch.zeros(*context_vec.shape[:-1], 1, dtype=context_vec.dtype,
+                                  device=context_vec.device)
+        else:
+            tau_t = torch.as_tensor(tau, dtype=context_vec.dtype, device=context_vec.device)
+            tau_enc = model.encode_time(tau_t).expand(*context_vec.shape[:-1], 1)
+        context_input = torch.cat([context_vec, tau_enc], dim=-1)
+        params = model.hypernet_xy(context_input)
         C = model.num_components_space
 
         means, l_diag, l_offdiag, weight_logits = torch.split(
