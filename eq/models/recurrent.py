@@ -311,7 +311,7 @@ class RecurrentTPP(TPPModel):
         xy_dist = self.get_xy_dist(context, batch.inter_times)  # new: p(x,y|τ,c)
         log_pdf_xy = xy_dist.log_prob(xy)              # (B, L)
         spatial_term  = (log_pdf_xy * batch.mask).sum(-1)
-        spatial_weight = 0.1
+        spatial_weight = 0.5
         log_like = log_like + spatial_weight*spatial_term
 
 
@@ -445,11 +445,12 @@ class RecurrentTPP(TPPModel):
             # Sample spatial locations and feed back into RNN
             # xy_dist = self.get_xy_dist(current_state)      # old: p(x,y|c)
             xy_dist = self.get_xy_dist(current_state, next_inter_times)  # new: p(x,y|τ,c)
-            next_xy = xy_dist.sample()                        # (B, 1, 2)
-            locations = torch.cat([locations, next_xy], dim=1)
-            next_x = next_xy[..., 0]                          # (B, 1)
-            next_y = next_xy[..., 1]                          # (B, 1)
-            rnn_input_list.append(self.encode_xy(next_x, next_y))  # (B, 1, 2)
+            next_xy_norm = xy_dist.sample()                   # (B, 1, 2) — normalized units
+            # De-normalize from σ-units back to km so the batch and RNN feedback are consistent
+            next_x = next_xy_norm[..., 0] * self.x_std + self.x_mean  # (B, 1)
+            next_y = next_xy_norm[..., 1] * self.y_std + self.y_mean  # (B, 1)
+            locations = torch.cat([locations, torch.stack([next_x, next_y], dim=-1)], dim=1)
+            rnn_input_list.append(self.encode_xy(next_x, next_y))  # km → normalizes correctly
 
             # RNN_input now has [inter_time, magnitude, and (x,y)]
             with torch.no_grad():

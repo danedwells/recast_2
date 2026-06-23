@@ -30,6 +30,7 @@ KM_PER_DEG_LON = KM_PER_DEG_LAT * np.cos(np.radians(MS_LAT))
 RADIUS_KM = 250.0
 MAG_MIN = 4.5   # matches ANSS global catalog completeness
 MAG_MAX = 8.0
+JITTER_KM = 150.0  # random spatial translation applied per sequence during training
 
 
 # ─── Helper: load a parquet catalog as a mainshock-centered Sequence ───────────
@@ -53,8 +54,8 @@ def load_mainshock_sequence(path, ms_lat, ms_lon, mc=4.5, radius_km=250.0):
 
     keep = dist_km <= radius_km
     df   = df[keep].reset_index(drop=True)
-    x_km = x_km[keep]
-    y_km = y_km[keep]
+    x_km = x_km[keep] - 100
+    y_km = y_km[keep] - 100
 
     # Time: fractional days from first event; 1-hour lead so first inter-time > 0
     t0 = df["time"].iloc[0]
@@ -105,8 +106,32 @@ if 'x_loc' not in anss_catalog.train[0]:
     shutil.rmtree(ANSS_DIR)
     anss_catalog = ANSS_MultiCatalog(**ANSS_PARAMS)
 
-print(f"Training sequences  : {len(anss_catalog.train)}")
-print(f"Validation sequences: {len(anss_catalog.val)}")
+
+def _keep_sequence(seq, max_depth_km=50.0, min_aftershocks=10):
+    """Return True if the sequence passes quality filters.
+
+    Filters:
+      1. Proxy mainshock depth ≤ max_depth_km — removes megathrust interface
+         and intraslab subduction events.  The mainshock is the event nearest
+         to the coordinate origin (x_loc=0, y_loc=0).
+      2. At least min_aftershocks events in the NLL window — removes sequences
+         from remote / poorly-instrumented regions that contribute no signal.
+    """
+    dist2 = seq.x_loc ** 2 + seq.y_loc ** 2
+    proxy_depth = float(seq.depth[dist2.argmin()].item())
+    if proxy_depth > max_depth_km:
+        return False
+    n_after = int((seq.arrival_times >= seq.t_nll_start).sum())
+    return n_after >= min_aftershocks
+
+
+for split in ("train", "val", "test"):
+    dataset = getattr(anss_catalog, split)
+    before = len(dataset)
+    kept = [seq for seq in dataset if _keep_sequence(seq)]
+    setattr(anss_catalog, split, eq.data.InMemoryDataset(kept))
+    print(f"{split}: {before} → {len(kept)} sequences after depth≤50 km + ≥10 aftershocks filter")
+
 print(f"Sequence keys       : {list(anss_catalog.train[0].keys())}")
 s0 = anss_catalog.train[0]
 print(f"x_loc range example : [{s0.x_loc.min():.0f}, {s0.x_loc.max():.0f}] km")
@@ -122,11 +147,14 @@ all_y   = np.concatenate([s.y_loc.numpy() for s in anss_catalog.train])
 all_tau = np.concatenate([s.inter_times[:-1].numpy() for s in anss_catalog.train])
 
 x_mean, y_mean = 0.0, 0.0
-x_std    = float(all_x.std())
-y_std    = float(all_y.std())
+# Inflate std to match training distribution: jitter adds uniform(±JITTER_KM)
+# variance = JITTER_KM² / 3, so std_effective = sqrt(std_raw² + JITTER_KM²/3)
+_jitter_std = JITTER_KM / np.sqrt(3)
+x_std    = float(np.sqrt(all_x.std()**2 + _jitter_std**2))
+y_std    = float(np.sqrt(all_y.std()**2 + _jitter_std**2))
 tau_mean = float(all_tau.mean())
 
-print(f"x_std={x_std:.1f} km  y_std={y_std:.1f} km")
+print(f"x_std={x_std:.1f} km  y_std={y_std:.1f} km  (includes {_jitter_std:.1f} km jitter)")
 print(f"tau_mean={tau_mean:.4f} days")
 
 
@@ -174,6 +202,36 @@ model = eq.models.RecurrentTPP(
 
 #%%
 # ─── Training — mini-batch over ANSS analog library ───────────────────────────
+from torch.utils.data import DataLoader
+from functools import partial
+
+
+def collate_with_jitter(sequences, max_km=100.0):
+    """Collate sequences with a random per-sequence spatial translation.
+
+    Shifts all events in each sequence by the same random (dx, dy), so the
+    mainshock is no longer always at (0, 0). The model must learn to locate
+    the mainshock from the event stream rather than memorising the origin as a
+    prior. Relative positions within a sequence are preserved.
+    """
+    jittered = []
+    for seq in sequences:
+        dx = float(np.random.uniform(-max_km, max_km))
+        dy = float(np.random.uniform(-max_km, max_km))
+        # Carry all extra fields (mag, mag_bounds, lat, lon, …) through unchanged
+        extra = {k: v for k, v in seq.items()
+                 if k not in seq.default_sequence_attrs}
+        extra['x_loc'] = seq.x_loc + dx
+        extra['y_loc'] = seq.y_loc + dy
+        jittered.append(eq.data.Sequence(
+            seq.inter_times.clone(),
+            t_start=seq.t_start,
+            t_nll_start=seq.t_nll_start,
+            **extra,
+        ))
+    return eq.data.Batch.from_list(jittered)
+
+
 _RETRAIN_ = True
 model.train()
 
@@ -185,7 +243,12 @@ if _RETRAIN_:
 
     optimizer = torch.optim.Adam(model.parameters(), lr=5e-4)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
-    train_loader = anss_catalog.train.get_dataloader(batch_size=32, shuffle=True)
+    train_loader = DataLoader(
+        anss_catalog.train,
+        batch_size=32,
+        shuffle=True,
+        collate_fn=partial(collate_with_jitter, max_km=JITTER_KM),
+    )
 
     running_loss = []
     for epoch in range(epochs):
@@ -217,7 +280,6 @@ if _RETRAIN_:
 
 #%%
 # ─── Load trained model ────────────────────────────────────────────────────────
-model = model.cpu()
 map_location = 'cuda' if torch.cuda.is_available() else 'cpu'
 model.load_state_dict(torch.load(f"{SAVE_DIR}/model_anss.pt", map_location=map_location))
 
@@ -230,7 +292,7 @@ print(f"Parameters: {total:,}")
 
 # ─── Inference — condition on mainshock, forecast aftershocks ──────────────────
 # Condition on the first ~2.4 hours (mainshock + any immediate early events)
-condition_days = seq.t_start + 0.1
+condition_days = seq.t_start + 0.5
 forecast_days  = seq.t_end - condition_days
 cond_seq = seq.get_subsequence(seq.t_start, condition_days)
 print(f"Conditioning events: {cond_seq.num_events}")
@@ -279,7 +341,7 @@ for i in range(predicted_batch.batch_size):
 
 past_batch   = eq.data.Batch.from_list([cond_seq])
 context_vec  = model.get_context(past_batch)[:, 0, :]
-plot_xy_mixture(model, context_vec, axes[1], alpha=0.1)
+plot_xy_mixture(model, context_vec, axes[1], alpha=0.05)
 axes[1].set_xlabel("East of mainshock (km)")
 axes[1].set_ylabel("North of mainshock (km)")
 axes[1].set_xlim([-100, 100])
@@ -356,7 +418,7 @@ for ax, ctx, title in [
         s = anss_catalog.train[i]
         ax.scatter(s.x_loc.numpy(), s.y_loc.numpy(), s=2, alpha=0.12, c='grey', zorder=1)
 
-    plot_xy_mixture(model, ctx, ax, alpha=0.5, tau=TAU_VIZ)
+    plot_xy_mixture(model, ctx, ax, alpha=0.05, tau=TAU_VIZ)
 
     ax.axhline(0, color='k', lw=0.6, ls='--')
     ax.axvline(0, color='k', lw=0.6, ls='--')
@@ -379,27 +441,46 @@ plt.show()
 
 
 #%%
-# ─── Prior inter-event time distribution (zero-context) ───────────────────────
-context_vec = torch.zeros(1, 1, model.context_size)
+# ─── Temporal mixture: zero context vs. Ridgecrest-conditioned ─────────────────
+# context_zero / context_cond computed in the spatial cell above.
 
-fig, ax = plt.subplots(figsize=(8, 4))
-plot_time_mixture(model, context_vec, ax, t_max=5.0)
-
-# Overlay observed inter-time histogram pooled from ANSS training sequences
-sample_inter = np.concatenate([
+# Reference histograms
+anss_inter = np.concatenate([
     anss_catalog.train[i].inter_times[:-1].numpy()
     for i in range(min(50, len(anss_catalog.train)))
 ])
-bins = np.logspace(-2, 3, 100)
-ax.hist(sample_inter, bins=bins, density=True, alpha=0.3, color='red',
-        rwidth=0.9, label='ANSS training (50 sequences)')
+# Only inter-times for events after the conditioning window, so the histogram
+# is comparable to what the conditioned distribution is predicting.
+post_cond_seq = seq.get_subsequence(condition_days, seq.t_end)
+rc_inter = post_cond_seq.inter_times[:-1].numpy()
 
-ax.set_xlabel('Inter-event time (days)')
-ax.set_ylabel('Density')
-ax.set_xlim([0, 0.5])
-ax.set_ylim([0, 30])
-ax.legend()
+T_MAX  = 5.0   # x-axis limit (days) — shrink to zoom in
+Y_MAX  = 30    # density y-axis
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+for ax, ctx, title, obs, obs_label in [
+    (axes[0], context_zero,
+     'Prior (zero context)',
+     anss_inter, 'ANSS training (50 seqs)'),
+    (axes[1], context_cond,
+     f'After conditioning seq  ({cond_seq.num_events} events)',
+     rc_inter,   f'Ridgecrest M≥{MAG_MIN} (post-conditioning)'),
+]:
+    plot_time_mixture(model, ctx, ax, t_max=T_MAX)
+    bins = np.logspace(-3, np.log10(T_MAX * 4), 60)
+    ax.hist(obs, bins=bins, density=True, alpha=0.35, color='red',
+            rwidth=0.9, label=obs_label)
+    ax.set_xlabel('Inter-event time (days)')
+    ax.set_ylabel('Density')
+    ax.set_xlim([0, 0.5])
+    ax.set_ylim([0, Y_MAX])
+    ax.set_title(title)
+    ax.legend(fontsize=8)
+
+plt.suptitle('Weibull inter-event time mixture', fontsize=12)
 plt.tight_layout()
+plt.savefig(f'{FIGS_DIR}/time_mixture.png', dpi=150, bbox_inches='tight')
 plt.show()
 
 
@@ -409,32 +490,51 @@ plt.show()
 Test effective memory
 ########################################
 """
+# Condition on the first day of Ridgecrest (mainshock + first day of aftershocks)
 condition_days = seq.t_start + 1
-forecast_days  = seq.t_end - condition_days + 400
-cond_seq = seq.get_subsequence(seq.t_start, condition_days)
+cond_seq_mem   = seq.get_subsequence(seq.t_start, condition_days)
+MEM_DURATION   = 60    # days to simulate forward in each panel
+MEM_BATCH      = 100   # trajectories
 
 model.eval()
-with torch.no_grad():
-    predicted_batch = model.sample(
-        batch_size=100,
-        duration=forecast_days,
-        t_start=condition_days,
-        past_seq=cond_seq,
-        mag_completeness=MAG_MIN,
-    )
 
-fig, ax = plt.subplots(figsize=(8, 6))
-for i in range(len(predicted_batch)):
-    mask = predicted_batch.mask[i].bool()
-    pinter_times  = np.diff(predicted_batch.arrival_times[i][~mask].numpy())
-    parrival_times = predicted_batch.arrival_times[i][~mask].numpy()[:-1]
-    ax.scatter(parrival_times, pinter_times, marker='o', s=20, c='b', alpha=0.5)
-ax.set_xlabel("Arrival Times")
-ax.set_xlim([0,50])
-ax.set_ylim([0, 30])
-ax.set_ylabel("Inter times")
+# Left panel: zero context — samples from the prior, no knowledge of mainshock
+# Right panel: Ridgecrest-conditioned — samples after seeing day-0 → day-1
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+for ax, past, title in [
+    (axes[0], None,          'Zero context (no history)'),
+    (axes[1], cond_seq_mem,  f'Ridgecrest-conditioned  ({cond_seq_mem.num_events} events, day 0–1)'),
+]:
+    t0 = 0.0 if past is None else past.t_end
+    with torch.no_grad():
+        pb = model.sample(
+            batch_size=MEM_BATCH,
+            duration=MEM_DURATION,
+            t_start=t0,
+            past_seq=past,
+            mag_completeness=MAG_MIN,
+        )
+    for i in range(len(pb)):
+        mask   = pb.mask[i].bool()
+        times  = pb.arrival_times[i][~mask].numpy()
+        if len(times) < 2:
+            continue
+        pinter    = np.diff(times)
+        parrival  = times[:-1] - t0   # relative to start of this panel
+        ax.scatter(parrival, pinter, marker='o', s=15, c='b', alpha=0.3)
+
+    ax.set_xlabel('Days since conditioning start')
+    ax.set_ylabel('Inter-event time (days)')
+    ax.set_xlim([0, 10])
+    ax.set_ylim([0, 10])
+    ax.set_title(title)
+
+plt.suptitle('Effective memory — does the RNN remember the mainshock?', fontsize=12)
+plt.tight_layout()
+plt.savefig(f'{FIGS_DIR}/effective_memory.png', dpi=150, bbox_inches='tight')
 plt.show()
-fig.savefig("test_effective_memory.png")
 
 
 #%%
@@ -460,7 +560,7 @@ with torch.no_grad():
 """
 Spatial forecast — magnitude and timing per grid cell
 """
-nx, ny     = 25, 25
+nx, ny     = 35,35
 mag_thresh = MAG_MIN
 
 # Use the test sequence spatial extent (mainshock-centered)
@@ -485,8 +585,19 @@ all_x = np.concatenate(all_x)
 all_y = np.concatenate(all_y)
 all_m = np.concatenate(all_m)
 
-ix = np.clip(np.digitize(all_x, x_bins) - 1, 0, nx - 1)
-iy = np.clip(np.digitize(all_y, y_bins) - 1, 0, ny - 1)
+# Filter to events within the grid domain before binning; np.clip was
+# routing out-of-domain events to boundary cells, inflating edge counts.
+in_domain = (
+    (all_x >= x_bins[0]) & (all_x < x_bins[-1]) &
+    (all_y >= y_bins[0]) & (all_y < y_bins[-1])
+)
+all_t = all_t[in_domain]
+all_x = all_x[in_domain]
+all_y = all_y[in_domain]
+all_m = all_m[in_domain]
+
+ix = np.digitize(all_x, x_bins) - 1
+iy = np.digitize(all_y, y_bins) - 1
 
 mag_grid    = np.full((nx, ny), np.nan)
 time_grid   = np.full((nx, ny), np.nan)
@@ -648,8 +759,9 @@ plt.show()
 Evaluate conditional intensity
 """
 nx_eval, ny_eval = 50, 50
-x_lin = np.linspace(-x_pad, x_pad, nx_eval)
-y_lin = np.linspace(-y_pad, y_pad, ny_eval)
+_ep = 50
+x_lin = np.linspace(-x_pad - _ep, x_pad + _ep, nx_eval)
+y_lin = np.linspace(-y_pad - _ep, y_pad + _ep, ny_eval)
 x_grid_np, y_grid_np = np.meshgrid(x_lin, y_lin)
 x_grid = torch.tensor(x_grid_np, dtype=torch.float32)
 y_grid = torch.tensor(y_grid_np, dtype=torch.float32)
@@ -713,8 +825,12 @@ ax.axhline(0, color='w', lw=0.5, ls='--'); ax.axvline(0, color='w', lw=0.5, ls='
 ax.set_xlabel('East of mainshock (km)')
 ax.set_ylabel('North of mainshock (km)')
 ax.set_title('Spatial marginal  Λ(x,y)  [time-averaged]')
+ax.set_xlim([-80,80])
+ax.set_ylim([-80,80])
 ax.legend(fontsize=8)
 
 plt.tight_layout()
 plt.savefig(f'{FIGS_DIR}/conditional_intensity.png', dpi=150, bbox_inches='tight')
 plt.show()
+
+# %%
