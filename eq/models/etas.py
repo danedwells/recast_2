@@ -113,6 +113,44 @@ def sample_aftershock_locations(parent_x, parent_y, parent_mag, d, gamma, rho, M
     return parent_x + r * np.cos(phi), parent_y + r * np.sin(phi)
 
 
+def window_fraction(x, y, d_g, rho, window, n_angles=256):
+    """Fraction of the isotropic power-law kernel mass that lands inside a rectangle.
+
+    For a parent at (x, y) inside the rectangle, Ω = ∫_W g(r − r_parent) dr.
+    The kernel is isotropic with radial CDF F(R) = 1 − (d_g / (R² + d_g))^ρ, and W is
+    convex, so Ω is the angular average of F evaluated at the distance R(φ) from the
+    parent to the rectangle edge along direction φ:
+
+        Ω = (1 / 2π) ∫₀^{2π} F(R(φ)) dφ
+
+    evaluated with a midpoint rule over n_angles directions. Differentiable in d_g, ρ.
+
+    Args:
+        x, y: Parent positions (km), shape (...).
+        d_g: Magnitude-scaled length scale of each parent, broadcastable to x.
+        rho: Spatial decay exponent (scalar tensor).
+        window: (x0, x1, y0, y1) rectangle bounds in km.
+
+    Returns:
+        Ω with shape (...), values in (0, 1].
+    """
+    x0, x1, y0, y1 = window
+    phi = (torch.arange(n_angles, dtype=x.dtype, device=x.device) + 0.5) * (
+        2 * math.pi / n_angles
+    )
+    cos, sin = torch.cos(phi), torch.sin(phi)
+    x, y, d_g = x.unsqueeze(-1), y.unsqueeze(-1), d_g.unsqueeze(-1)
+    big = 1e9
+    # Distance to the vertical / horizontal edge hit by each ray (inf if parallel)
+    r_x = torch.where(cos > 0, (x1 - x) / cos, (x0 - x) / cos)
+    r_y = torch.where(sin > 0, (y1 - y) / sin, (y0 - y) / sin)
+    r_x = torch.where(cos.abs() < 1e-9, torch.full_like(r_x, big), r_x)
+    r_y = torch.where(sin.abs() < 1e-9, torch.full_like(r_y, big), r_y)
+    R = torch.minimum(r_x, r_y).clamp(min=0.0)
+    F = 1 - (d_g / (R.pow(2) + d_g)).pow(rho)
+    return F.mean(-1)
+
+
 class ETAS(TPPModel):
     """Epidemic-type aftershock sequence model (Ogata, 1988).
 
@@ -148,6 +186,12 @@ class ETAS(TPPModel):
         spatial_R_bg: Radius (km) of the uniform disk used for background event
             locations. Also defines the effective background density μ/(π R_bg²)
             used in the spatial log-intensity.
+        spatial_window: Optional (x0, x1, y0, y1) rectangle in km. If given, the model is
+            scored as a process restricted to that window: background is uniform on the
+            rectangle (μ / area, R_bg is ignored) and the compensator multiplies each
+            parent's Omori integral by the fraction of its spatial kernel inside the
+            window (see window_fraction). If None, the kernel is assumed to integrate
+            to 1 over the whole plane.
     """
 
     def __init__(
@@ -167,8 +211,10 @@ class ETAS(TPPModel):
         spatial_gamma_init: float = 1.0,
         spatial_rho_init: float = 1.0,
         spatial_R_bg: float = 250.0,
+        spatial_window: Optional[tuple] = None,
     ):
         super().__init__()
+        self.spatial_window = tuple(float(v) for v in spatial_window) if spatial_window else None
         self.log_p = nn.Parameter(torch.tensor(math.log(omori_p_init)))
         self.log_c = nn.Parameter(torch.tensor(math.log(omori_c_init)))
         self.log_mu = nn.Parameter(torch.tensor(math.log(base_rate_init)))
@@ -291,7 +337,16 @@ class ETAS(TPPModel):
             # Background intensity per unit area: μ / (π R_bg²).
             # This means background events are uniform over the circle of radius R_bg,
             # and integrating over that circle recovers the total background rate μ.
-            mu_area = self.mu / (math.pi * self.spatial_R_bg.pow(2))
+            if self.spatial_window is None:
+                mu_area = self.mu / (math.pi * self.spatial_R_bg.pow(2))
+                omega = 1.0
+            else:
+                x0, x1, y0, y1 = self.spatial_window
+                mu_area = self.mu / ((x1 - x0) * (y1 - y0))
+                # Per-parent fraction of kernel mass inside the window, shape (B, L)
+                omega = window_fraction(
+                    batch.x_loc, batch.y_loc, d_g.squeeze(-2), self.rho, self.spatial_window
+                )
 
             log_intensity = (
                 torch.log(
@@ -308,11 +363,13 @@ class ETAS(TPPModel):
                 )
                 * intensity_mask
             ).sum(-1)
+            omega = 1.0
         # ── End spatial intensity term ─────────────────────────────────────────
 
-        # Integrated intensity (compensator) — unchanged by the spatial extension
-        # because ∫∫ g(x,y|parent) dx dy = 1 over the infinite plane, and the
-        # background disk integrates to 1 as well.
+        # Integrated intensity (compensator). Without a window, ∫∫ g dx dy = 1 over the
+        # infinite plane and the background integrates to 1, so the spatial extension
+        # leaves it unchanged (omega = 1). With a window, each parent's offspring rate is
+        # scaled by omega = ∫_W g, since offspring outside W are never observed.
         one_minus_p = 1 - self.p
         t_end = batch.t_end.unsqueeze(-1)  # (B, 1)
         t_nll_start = batch.t_nll_start.unsqueeze(-1)  # (B, 1)
@@ -325,7 +382,7 @@ class ETAS(TPPModel):
             start_idx=torch.zeros_like(batch.start_idx),
             end_idx=batch.end_idx,
         )
-        integral = (omori_int * productivity * survival_mask).sum(-1)
+        integral = (omori_int * productivity * omega * survival_mask).sum(-1)
         integral += (batch.t_end - batch.t_nll_start) * self.mu
         return (-log_intensity + integral) / (batch.t_end - batch.t_nll_start)  # (B,)
 

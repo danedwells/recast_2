@@ -30,6 +30,18 @@ class RecurrentTPP(TPPModel):
         richter_b: Fixed b value of the Gutenberg-Richter distribution for magnitudes.
         mag_completeness: Magnitude of completeness of the catalog.
         learning_rate: Learning rate used in optimization.
+        time_weight: Weight applied to the temporal NLL term.
+        spatial_weight: Weight applied to the spatial (x, y) NLL term. Set to 0.0
+            to train/evaluate on the temporal marginal only, leaving the spatial
+            decoder untrained.
+        spatial_dist: Component distribution family for the spatial mixture,
+            either 'gaussian' (torch MultivariateNormal, default) or
+            'student_t' (heavier-tailed eq.distributions.MultivariateStudentT).
+            Same hypernet_xy architecture and parameter count either way, so
+            switching back to 'gaussian' requires no other changes.
+        spatial_df: Degrees of freedom for the spatial Student-t component,
+            fixed (not learned) and shared across all mixture components.
+            Only used when spatial_dist='student_t'.
     """
 
     def __init__(
@@ -49,6 +61,10 @@ class RecurrentTPP(TPPModel):
         y_std: float = 1.0,
         richter_b: float = 1.0,
         learning_rate: float = 5e-2,
+        time_weight: float = 1.0,
+        spatial_weight: float = 1.0,
+        spatial_dist: str = "gaussian",
+        spatial_df: float = 4.0,
         *args,
         **kwargs
     ):
@@ -64,7 +80,15 @@ class RecurrentTPP(TPPModel):
         self.register_buffer("tau_mean", torch.tensor(tau_mean, dtype=torch.float64))
         self.register_buffer("log_tau_mean", self.tau_mean.log())
         self.register_buffer("richter_b", torch.tensor(richter_b, dtype=torch.float64))
-        
+        self.time_weight = time_weight
+        self.spatial_weight = spatial_weight
+        if spatial_dist not in ("gaussian", "student_t"):
+            raise ValueError(
+                f"spatial_dist must be one of ['gaussian', 'student_t'] (got {spatial_dist})"
+            )
+        self.spatial_dist = spatial_dist
+        self.spatial_df = spatial_df
+
         # Spatial encoding statistics (register as buffers like tau_mean)
         self.register_buffer("x_mean", torch.tensor(x_mean, dtype=torch.float32))
         self.register_buffer("x_std",  torch.tensor(x_std,  dtype=torch.float32))
@@ -225,11 +249,15 @@ class RecurrentTPP(TPPModel):
         )
 
     def get_xy_dist(self, context, inter_times):
-        """Get a 2D Gaussian mixture distribution over (x, y) given context and τ.
+        """Get a 2D spatial mixture distribution over (x, y) given context and τ.
 
         Option B: p(x,y | τ, c) — spatial parameters conditioned on inter-event time
         so that aftershock proximity and background diffusion emerge from the same decoder.
         inter_times must broadcast against context's leading dimensions.
+
+        The component family is controlled by self.spatial_dist ('gaussian' or
+        'student_t') — same (loc, scale_tril) decoded either way, just wrapped
+        in a different component distribution.
         """
         # Option B: concatenate encoded τ to context before decoding spatial params.
         # Revert by removing the cat and passing context directly to hypernet_xy.
@@ -262,15 +290,21 @@ class RecurrentTPP(TPPModel):
 
         weight_logits = F.log_softmax(weight_logits, dim=-1)
 
-        component_dist = torch.distributions.MultivariateNormal(
-            loc=means,
-            scale_tril=L,   # accepts Cholesky directly — no need to form Σ explicitly
-        )
+        if self.spatial_dist == "gaussian":
+            component_dist = torch.distributions.MultivariateNormal(
+                loc=means,
+                scale_tril=L,   # accepts Cholesky directly — no need to form Σ explicitly
+            )
+        else:  # "student_t"
+            component_dist = dist.MultivariateStudentT(
+                loc=means,
+                scale_tril=L,
+                df=self.spatial_df,
+            )
 
-        # We need a mixture distribution for the gaussians
+        # We need a mixture distribution to combine the components
         mixture_dist = Categorical(logits=weight_logits)
 
-        # Combine the Gaussians 
         return dist.MixtureSameFamily(
             mixture_distribution=mixture_dist,
             component_distribution=component_dist,
@@ -283,12 +317,45 @@ class RecurrentTPP(TPPModel):
         mag_min = mag_completeness.unsqueeze(1) * torch.ones_like(b[0, :])  # FLAG 
         return dist.GutenbergRichter(b=b, mag_min=mag_min)
 
-    def nll_loss(self, batch: eq.data.Batch) -> torch.Tensor:
+    def _log_mass_in_window(self, xy_dist, window, n_samples=1024, chunk=128, seed=0):
+        """log P(r ∈ W) under the spatial mixture, by Monte Carlo (no closed form for
+        correlated components over a rectangle). Used only for window-normalized scoring.
+
+        Args:
+            xy_dist: Mixture with batch shape (B, L), event shape (2,), in standardized units.
+            window: (x0, x1, y0, y1) in km.
+
+        Returns:
+            log Z, shape (B, L).
+        """
+        x0, x1, y0, y1 = window
+        lo = torch.stack([(x0 - self.x_mean) / self.x_std, (y0 - self.y_mean) / self.y_std])
+        hi = torch.stack([(x1 - self.x_mean) / self.x_std, (y1 - self.y_mean) / self.y_std])
+        gen_state = torch.get_rng_state()
+        torch.manual_seed(seed)  # fixed seed → deterministic evaluation
+        try:
+            inside = torch.zeros(xy_dist.batch_shape, dtype=torch.float32, device=lo.device)
+            for start in range(0, n_samples, chunk):
+                n = min(chunk, n_samples - start)
+                s = xy_dist.sample((n,))  # (n, B, L, 2)
+                inside += ((s >= lo) & (s <= hi)).all(-1).float().sum(0)
+        finally:
+            torch.set_rng_state(gen_state)
+        return torch.log(inside.clamp_min(1.0) / n_samples)
+
+    def nll_loss(self, batch: eq.data.Batch, window=None) -> torch.Tensor:
         """
         Compute negative log-likelihood (NLL) for a batch of event sequences.
 
+        The spatial term is a density per km². If ``window=(x0, x1, y0, y1)`` (km) is given,
+        the spatial density is renormalized over that rectangle so the result is the
+        likelihood of the process restricted to the window, directly comparable with
+        ``ETAS(spatial_window=window).nll_loss``. Intended for evaluation (Monte Carlo,
+        not differentiable w.r.t. the mixture parameters).
+
         Args:
             batch: Batch of padded event sequences.
+            window: Optional observation rectangle in km.
 
         Returns:
             nll: NLL of each sequence, shape (batch_size,)
@@ -309,10 +376,16 @@ class RecurrentTPP(TPPModel):
         xy = self.encode_xy(batch.x_loc, batch.y_loc)  # (B, L, 2)
         # xy_dist = self.get_xy_dist(context)          # old: p(x,y|c) independent of τ
         xy_dist = self.get_xy_dist(context, batch.inter_times)  # new: p(x,y|τ,c)
-        log_pdf_xy = xy_dist.log_prob(xy)              # (B, L)
+        log_pdf_xy = xy_dist.log_prob(xy)              # (B, L), standardized units
+        # Change of variables to a density per km²: p_km = p_norm / (σx σy).
+        # Constant w.r.t. parameters (σ are buffers), so gradients are unchanged.
+        log_pdf_xy = log_pdf_xy - self.x_std.log() - self.y_std.log()
+        if window is not None:
+            # Renormalize p(x,y|τ,c) over the observation window W (a proper density on W).
+            log_pdf_xy = log_pdf_xy - self._log_mass_in_window(xy_dist, window)
+
         spatial_term  = (log_pdf_xy * batch.mask).sum(-1)
-        spatial_weight = 0.5
-        log_like = log_like + spatial_weight*spatial_term
+        log_like = self.time_weight * log_like + self.spatial_weight * spatial_term
 
 
         # LAST REAL EVENT - survival
@@ -327,12 +400,6 @@ class RecurrentTPP(TPPModel):
             batch.inter_times[arange, batch.end_idx]
         )
         log_like = log_like + last_log_surv.squeeze(-1)  # (B,)
-
-        #  DEBUG
-        time_nll = -(log_pdf * batch.mask).sum(-1).mean()
-        xy_nll = -(log_pdf_xy * batch.mask).sum(-1).mean()
-        lls_nll = last_log_surv
-        #print(f"Time NLL: {time_nll:.3f}, XY NLL: {xy_nll:.3f}")#, LLS : {lls_nll:.3f}")
 
         # FIRST REAL EVENT - survival. Remove anything before.
         # Remove survival time from t_prev to t_nll_start
@@ -450,7 +517,12 @@ class RecurrentTPP(TPPModel):
             next_x = next_xy_norm[..., 0] * self.x_std + self.x_mean  # (B, 1)
             next_y = next_xy_norm[..., 1] * self.y_std + self.y_mean  # (B, 1)
             locations = torch.cat([locations, torch.stack([next_x, next_y], dim=-1)], dim=1)
-            rnn_input_list.append(self.encode_xy(next_x, next_y))  # km → normalizes correctly
+            if self.spatial_weight == 0:
+                # Spatial decoder is untrained noise — don't let it feed back into
+                # the RNN state and contaminate future temporal predictions.
+                rnn_input_list.append(self.encode_xy(torch.zeros_like(next_x), torch.zeros_like(next_y)))
+            else:
+                rnn_input_list.append(self.encode_xy(next_x, next_y))  # km → normalizes correctly
 
             # RNN_input now has [inter_time, magnitude, and (x,y)]
             with torch.no_grad():

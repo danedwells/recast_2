@@ -6,7 +6,6 @@ import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR
 torch.set_num_threads(1)
 import matplotlib.pyplot as plt
-from matplotlib.patches import Ellipse
 import os
 import shutil
 from plot_helpers import *
@@ -54,8 +53,8 @@ def load_mainshock_sequence(path, ms_lat, ms_lon, mc=4.5, radius_km=250.0):
 
     keep = dist_km <= radius_km
     df   = df[keep].reset_index(drop=True)
-    x_km = x_km[keep] - 100
-    y_km = y_km[keep] - 100
+    x_km = x_km[keep] -10
+    y_km = y_km[keep] -10
 
     # Time: fractional days from first event; 1-hour lead so first inter-time > 0
     t0 = df["time"].iloc[0]
@@ -188,6 +187,8 @@ plt.show()
 
 #%%
 # ─── Model ─────────────────────────────────────────────────────────────────────
+spatial_dist = 'student_t'
+
 model = eq.models.RecurrentTPP(
     context_size=256,
     num_components_time=8,
@@ -197,6 +198,9 @@ model = eq.models.RecurrentTPP(
     y_mean=y_mean,
     x_std=x_std,
     y_std=y_std,
+    spatial_dist = spatial_dist,
+    spatial_weight=1,
+    spatial_df= 4
 )
 
 
@@ -310,38 +314,57 @@ print(len(predicted_batch))
 
 #%%
 # ─── Plot: observed vs. sampled ────────────────────────────────────────────────
-fig, axes = plt.subplots(2, 1, figsize=(7, 11))
+fig, axes = plt.subplots(1,2, figsize=(12,6))
 
-axes[0].stem(seq.arrival_times.numpy(), seq.mag.numpy(),
-             linefmt='red', markerfmt='o', basefmt=' ', label='Observed')
+def _msize(m):
+    """Marker area (pt²) growing with magnitude: ~6 at MAG_MIN, ~73 at M7."""
+    return 12 * (np.asarray(m) - MAG_MIN + 1) ** 2
+
+# Stem markers can't vary in size, so hide them and overlay scatter dots instead.
+ml, _, _ = axes[0].stem(seq.arrival_times.numpy(), seq.mag.numpy(),
+                        linefmt='red', markerfmt='o', basefmt=' ', label='Observed')
+ml.set_visible(False)
+axes[0].scatter(seq.arrival_times.numpy(), seq.mag.numpy(),
+                s=_msize(seq.mag.numpy()), color='red', zorder=3)
 axes[0].axvline(condition_days, color='k', linestyle='--', label='Condition cutoff')
 
 for i in range(predicted_batch.batch_size):
     mask    = predicted_batch.mask[i].bool()
     p_times = predicted_batch.arrival_times[i][~mask].numpy()
     p_mags  = predicted_batch.mag[i][~mask].numpy()
-    axes[0].stem(p_times, p_mags, linefmt='b', markerfmt='.', basefmt=' ',
-                 label='Forecast' if i == 0 else None)
+    ml, _, _ = axes[0].stem(p_times, p_mags, linefmt='b', markerfmt='.', basefmt=' ',
+                            label='Forecast' if i == 0 else None)
+    ml.set_visible(False)
+    axes[0].scatter(p_times, p_mags, s=_msize(p_mags), color='b', alpha=0.6, zorder=3)
 
 axes[0].set_xlabel("Days since mainshock")
 axes[0].set_ylabel("Magnitude")
 axes[0].legend()
+axes[0].set_ylim(2,8)
 
 obs_mask_train = seq.arrival_times.numpy() <= condition_days
+obs_mags = seq.mag.numpy()
 axes[1].scatter(seq.x_loc.numpy()[obs_mask_train],  seq.y_loc.numpy()[obs_mask_train],
-                s=12, color='salmon', alpha=0.6, label='Observed (condition)')
+                s=_msize(obs_mags[obs_mask_train]), color='salmon', alpha=0.6,
+                label='Observed (condition)')
 axes[1].scatter(seq.x_loc.numpy()[~obs_mask_train], seq.y_loc.numpy()[~obs_mask_train],
-                s=12, color='red', alpha=0.8, label='Observed (forecast period)')
+                s=_msize(obs_mags[~obs_mask_train]), color='red', alpha=0.8,
+                label='Observed (forecast period)')
 
 for i in range(predicted_batch.batch_size):
     mask = predicted_batch.mask[i].bool()
     x = predicted_batch.x_loc[i][~mask].numpy()
     y = predicted_batch.y_loc[i][~mask].numpy()
-    axes[1].scatter(x, y, s=8, alpha=0.3, color='b', label='Forecast' if i == 0 else None)
+    m = predicted_batch.mag[i][~mask].numpy()
+    axes[1].scatter(x, y, s=_msize(m), alpha=0.3, color='b', label='Forecast' if i == 0 else None)
 
 past_batch   = eq.data.Batch.from_list([cond_seq])
 context_vec  = model.get_context(past_batch)[:, 0, :]
-plot_xy_mixture(model, context_vec, axes[1], alpha=0.05)
+# if spatial_dist == 'student_t':
+
+#     plot_xy_mixture_student_t(model, context_vec, axes[1],)
+# elif spatial_dist == 'gaussian':
+#     plot_xy_mixture(model, context_vec, axes[1], alpha=0.05)
 axes[1].set_xlabel("East of mainshock (km)")
 axes[1].set_ylabel("North of mainshock (km)")
 axes[1].set_xlim([-100, 100])
@@ -417,8 +440,11 @@ for ax, ctx, title in [
     for i in range(min(8, len(anss_catalog.train))):
         s = anss_catalog.train[i]
         ax.scatter(s.x_loc.numpy(), s.y_loc.numpy(), s=2, alpha=0.12, c='grey', zorder=1)
+    if spatial_dist == 'student_t':
 
-    plot_xy_mixture(model, ctx, ax, alpha=0.05, tau=TAU_VIZ)
+        plot_xy_mixture_student_t(model, ctx, ax, tau=TAU_VIZ)
+    elif spatial_dist == 'gaussian':
+        plot_xy_mixture(model, ctx, ax, alpha=0.05, tau=TAU_VIZ)
 
     ax.axhline(0, color='k', lw=0.6, ls='--')
     ax.axvline(0, color='k', lw=0.6, ls='--')

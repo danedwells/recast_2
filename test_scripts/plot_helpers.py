@@ -72,6 +72,67 @@ def plot_xy_mixture(model, context_vec, ax, n_std=2.0, alpha=0.3, tau=None):
             ax.add_patch(ellipse)
 
 
+"""
+########################################
+# Plot Student-t (or Gaussian) mixture as density contours
+########################################
+"""
+def plot_xy_mixture_student_t(model, context_vec, ax, tau=None, extent=None,
+                              mass_levels=(0.5, 0.9, 0.99), n_grid=300,
+                              show_means=True, cmap='Blues'):
+    """
+    Plot the spatial mixture p(x, y | tau, context) as highest-density contours.
+
+    Student-t components have no finite n-sigma ellipse (covariance is infinite
+    for df <= 2), so instead the density is evaluated on a km grid via
+    model.get_xy_dist (the exact decoder, so heavy tails are shown faithfully)
+    and contoured at the density thresholds enclosing `mass_levels` of the
+    probability mass inside the grid. Also works for spatial_dist='gaussian'.
+
+    context_vec: single context vector, shape (1, 1, context_size)
+    tau: inter-event time for spatial conditioning (None uses tau_mean, i.e. zero encoding)
+    extent: (xmin, xmax, ymin, ymax) in km; default model.x/y_mean ± 3 std
+    mass_levels: fractions of grid mass enclosed by each contour
+    show_means: mark component means, sized by mixture weight
+    """
+    with torch.no_grad():
+        ctx = context_vec.reshape(-1)                       # (context_size,)
+        tau_t = (model.tau_mean if tau is None
+                 else torch.as_tensor(tau)).to(dtype=ctx.dtype, device=ctx.device)
+        xy_dist = model.get_xy_dist(ctx, tau_t)             # batch_shape (), standardized units
+
+        xm, ym = model.x_mean.item(), model.y_mean.item()
+        xs, ys = model.x_std.item(), model.y_std.item()
+        if extent is None:
+            extent = (xm - 3 * xs, xm + 3 * xs, ym - 3 * ys, ym + 3 * ys)
+        gx = torch.linspace(extent[0], extent[1], n_grid)
+        gy = torch.linspace(extent[2], extent[3], n_grid)
+        X, Y = torch.meshgrid(gx, gy, indexing='xy')        # (n_grid, n_grid), rows = y
+        xy_norm = torch.stack([(X - xm) / xs, (Y - ym) / ys], dim=-1).to(ctx)
+        dens = (xy_dist.log_prob(xy_norm).exp() / (xs * ys)).cpu().numpy()  # per km²
+
+        # Density thresholds enclosing the requested fractions of grid mass
+        cell = (gx[1] - gx[0]).item() * (gy[1] - gy[0]).item()
+        flat = np.sort(dens.ravel())[::-1]
+        cum = np.cumsum(flat) * cell
+        cum /= cum[-1]
+        thresholds = [flat[min(np.searchsorted(cum, m), len(flat) - 1)] for m in mass_levels]
+        order = np.argsort(thresholds)                      # contour needs ascending levels
+        levels = [thresholds[i] for i in order]
+        fmt = {thresholds[i]: f"{int(round(mass_levels[i] * 100))}%" for i in range(len(levels))}
+
+        colors = plt.get_cmap(cmap)(np.linspace(0.45, 0.95, len(levels)))  # keep outer contours visible
+        cs = ax.contour(X.numpy(), Y.numpy(), dens, levels=levels, colors=colors,
+                        linewidths=1.2, zorder=3)
+        ax.clabel(cs, cs.levels, fmt=fmt, fontsize=7)
+
+        if show_means:
+            means = xy_dist.component_distribution.loc.cpu().numpy()        # (C, 2) standardized
+            w = xy_dist.mixture_distribution.probs.cpu().numpy()            # (C,)
+            ax.scatter(means[:, 0] * xs + xm, means[:, 1] * ys + ym,
+                       s=10 + 400 * w, c='k', alpha=0.5, zorder=4)
+
+
 # %%
 """
 ########################################

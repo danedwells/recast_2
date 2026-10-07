@@ -65,7 +65,7 @@ PARAMETER UNITS (etas_2 convention):
         Therefore RECAST's fitted k ≈ k0 / ∫(t+c)^(-p)dt = k0 × (p−1) / c^(1−p).
         p, c, and alpha are directly comparable; k and mu have different units/norms.
 """
-
+#%%
 import json
 import os
 import sys
@@ -83,7 +83,8 @@ ETAS2_ROOT = os.path.abspath(
 if ETAS2_ROOT not in sys.path:
     sys.path.insert(0, ETAS2_ROOT)
 
-from etas.simulation import generate_catalog
+from etas.simulation import generate_catalog, simulate_catalog_continuation
+from etas.mc_b_est import simulate_magnitudes
 
 # ── Output directory ────────────────────────────────────────────────────────────
 # Stored alongside the real case-study parquets so test scripts find them easily.
@@ -118,12 +119,13 @@ KM_PER_LAT = 111.1
 KM_PER_LON = KM_PER_LAT * np.cos(np.radians(LAT_CTR))  # ≈ 91.0 km/° at 35°N
 
 # ── Catalog generation settings ─────────────────────────────────────────────────
-N_CATALOGS = 300    # total number of independent 30-day catalogs to generate
+N_CATALOGS = 1000    # total number of independent 30-day catalogs to generate
 T_DAYS     = 30     # duration of each catalog window [days]
-MC         = 3.6    # magnitude of completeness (catalog lower threshold)
+MC         = 3.0    # magnitude of completeness (catalog lower threshold)
 BETA_MAIN  = np.log(10)  # Gutenberg-Richter β = b × ln(10);  b=1 → β≈2.303
 DELTA_M    = 0.1    # magnitude bin width used internally by etas_2
 RANDOM_SEED = 42    # fix numpy seed before generation for reproducibility
+M_MAINSHOCK_MIN = 5.5  # minimum mainshock magnitude for seeded sequences
 
 # ── True ETAS parameters (etas_2 convention) ────────────────────────────────────
 # These are close to the California calibration (etas_2/config/simulate_catalog_config.json)
@@ -184,7 +186,7 @@ polygon = Polygon([
 # ═══════════════════════════════════════════════════════════════════════════════
 # GENERATE CATALOGS
 # ═══════════════════════════════════════════════════════════════════════════════
-
+#%%
 np.random.seed(RANDOM_SEED)  # fix global numpy state for reproducibility
 
 all_catalogs = []
@@ -192,27 +194,63 @@ t_wall_start = time.time()
 T_ORIGIN = pd.Timestamp("2000-01-01")   # arbitrary absolute start — only relative
                                          # times matter inside RECAST sequences
 
-print(f"\nGenerating {N_CATALOGS} × {T_DAYS}-day ETAS catalogs...")
-for i in range(N_CATALOGS):
-    # Each catalog gets its own non-overlapping time window.
-    # The window label doesn't affect the statistics — each catalog is seeded
-    # independently — but it avoids confusing pandas when concatenating.
-    t_start = T_ORIGIN + pd.Timedelta(days=i * T_DAYS)
-    t_end   = t_start  + pd.Timedelta(days=T_DAYS)
+# ── ORIGINAL: pure background-Poisson catalogs (kept for reference) ─────────────
+# print(f"\nGenerating {N_CATALOGS} × {T_DAYS}-day ETAS catalogs...")
+# for i in range(N_CATALOGS):
+#     t_start = T_ORIGIN + pd.Timedelta(days=i * T_DAYS)
+#     t_end   = t_start  + pd.Timedelta(days=T_DAYS)
+#     cat = generate_catalog(
+#         polygon          = polygon,
+#         timewindow_start = t_start,
+#         timewindow_end   = t_end,
+#         parameters       = TRUE_PARAMS,
+#         mc               = MC,
+#         beta_main        = BETA_MAIN,
+#         delta_m          = DELTA_M,
+#     )
+#     cat = cat[["latitude", "longitude", "time", "magnitude"]].copy()
+#     cat["catalog_id"] = i
+#     all_catalogs.append(cat)
+#     if (i + 1) % 50 == 0:
+#         elapsed = time.time() - t_wall_start
+#         print(f"  [{i+1}/{N_CATALOGS}]  events this catalog: {len(cat):3d}  "
+#               f"elapsed: {elapsed:.1f}s")
 
-    cat = generate_catalog(
-        polygon          = polygon,
-        timewindow_start = t_start,
-        timewindow_end   = t_end,
-        parameters       = TRUE_PARAMS,
-        mc               = MC,
-        beta_main        = BETA_MAIN,
-        delta_m          = DELTA_M,
+# ── Seeded-mainshock approach ────────────────────────────────────────────────────
+# Each catalog is seeded with a single mainshock drawn from a GR distribution
+# above M_MAINSHOCK_MIN, placed at a random location within the polygon.
+# simulate_catalog_continuation then generates background events and all
+# aftershock generations within the T_DAYS window.  Every sequence is
+# guaranteed to have a visible mainshock-aftershock structure.
+print(f"\nGenerating {N_CATALOGS} × {T_DAYS}-day seeded-mainshock catalogs ...")
+for i in range(N_CATALOGS):
+    t_mainshock = T_ORIGIN + pd.Timedelta(days=i * (T_DAYS + 1))
+    t_sim_end   = t_mainshock + pd.Timedelta(days=T_DAYS)
+
+    ms_mag = float(simulate_magnitudes(1, beta=BETA_MAIN, mc=M_MAINSHOCK_MIN, m_max=8.0)[0])
+    ms_lat = float(np.random.uniform(LAT_MIN, LAT_MAX))
+    ms_lon = float(np.random.uniform(LON_MIN, LON_MAX))
+
+    mainshock_df = pd.DataFrame({
+        "latitude"  : [ms_lat],
+        "longitude" : [ms_lon],
+        "time"      : [t_mainshock],
+        "magnitude" : [ms_mag],
+        "xi_plus_1" : [1.0],
+    })
+
+    cat = simulate_catalog_continuation(
+        auxiliary_catalog = mainshock_df,
+        auxiliary_start   = t_mainshock,
+        auxiliary_end     = t_mainshock,
+        polygon           = polygon,
+        simulation_end    = t_sim_end,
+        parameters        = TRUE_PARAMS,
+        mc                = MC,
+        beta_main         = BETA_MAIN,
+        delta_m           = DELTA_M,
     )
 
-    # generate_catalog may return an empty DataFrame when no events occur.
-    # These empty catalogs are kept (marked by catalog_id) so the test script
-    # can report the true fraction of empty sequences.
     cat = cat[["latitude", "longitude", "time", "magnitude"]].copy()
     cat["catalog_id"] = i
     all_catalogs.append(cat)
@@ -275,3 +313,70 @@ with open(json_path, "w") as f:
     json.dump(meta, f, indent=2)
 print(f"Saved metadata: {json_path}")
 print("\nRun test_replicate_ETAS.py next.")
+
+# %%
+# ═══════════════════════════════════════════════════════════════════════════════
+# VISUALIZATION — inspect one sequence at a time
+# Change SEQUENCE_ID to view a different catalog (0 to N_CATALOGS-1).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import matplotlib.pyplot as plt
+
+SEQUENCE_ID = 10  # <-- change this integer to inspect a different sequence
+
+parquet_path = os.path.join(OUT_DIR, "raw_catalogs.parquet")
+df_all = pd.read_parquet(parquet_path)
+seq = df_all[df_all["catalog_id"] == SEQUENCE_ID].copy().sort_values("time").reset_index(drop=True)
+
+if len(seq) == 0:
+    print(f"Sequence {SEQUENCE_ID} is empty — try a different SEQUENCE_ID.")
+else:
+    t0 = seq["time"].iloc[0]
+    seq["t_days"] = (seq["time"] - t0).dt.total_seconds() / 86400.0
+
+    fig, (ax_t, ax_s) = plt.subplots(2, 1, figsize=(10, 8))
+    fig.suptitle(
+        f"ETAS Synthetic Sequence — catalog_id={SEQUENCE_ID}  ({len(seq)} events)",
+        fontsize=12,
+    )
+
+    # Top: time-magnitude stem plot
+    markerline, stemlines, baseline = ax_t.stem(
+        seq["t_days"], seq["magnitude"],
+        markerfmt="C0o", linefmt="C0-", basefmt="k-",
+    )
+    markerline.set_markersize(4)
+    plt.setp(stemlines, linewidth=0.7, alpha=0.6)
+    ax_t.axhline(MC, color="gray", linestyle="--", linewidth=0.8, label=f"Mc = {MC}")
+    ax_t.set_xlim(0, T_DAYS)
+    ax_t.set_xlabel("Time [days since first event]")
+    ax_t.set_ylabel("Magnitude")
+    ax_t.legend(fontsize=9)
+
+    # Bottom: spatial distribution coloured by magnitude
+    sc = ax_s.scatter(
+        seq["longitude"], seq["latitude"],
+        c=seq["magnitude"], cmap="hot_r",
+        s=20 + 8 * (seq["magnitude"] - MC),
+        vmin=MC, vmax=max(seq["magnitude"].max(), MC + 1),
+        alpha=0.8, edgecolors="k", linewidths=0.3,
+    )
+    plt.colorbar(sc, ax=ax_s, label="Magnitude")
+    ax_s.scatter(
+        seq["longitude"].iloc[0], seq["latitude"].iloc[0],
+        marker="*", s=150, color="red", zorder=5, label="First event",
+    )
+    ax_s.set_xlim(LON_MIN, LON_MAX)
+    ax_s.set_ylim(LAT_MIN, LAT_MAX)
+    ax_s.set_xlabel("Longitude [°]")
+    ax_s.set_ylabel("Latitude [°]")
+    ax_s.set_aspect("equal", adjustable="box")
+    ax_s.legend(fontsize=9)
+
+    plt.tight_layout()
+    out_fig = os.path.join(OUT_DIR, f"sequence_{SEQUENCE_ID:03d}.png")
+    plt.savefig(out_fig, dpi=150)
+    plt.show()
+    print(f"Saved figure: {out_fig}")
+
+# %%
