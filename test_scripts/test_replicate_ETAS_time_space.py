@@ -503,7 +503,7 @@ print(f"Spatial component distribution: {SPATIAL_DIST}"
       + (f" (df={SPATIAL_DF})" if SPATIAL_DIST == "student_t" else ""))
 #%%
 # ── Training configuration ──────────────────────────────────────────────────────
-_RETRAIN_   = True   # set False to skip training and just load the saved checkpoint
+_RETRAIN_   = False   # set False to skip training and just load the saved checkpoint
 EPOCHS      = 900
 BATCH_SIZE  = 32
 
@@ -768,6 +768,84 @@ plt.show()
 
 
 #%%
+# ─── Section 9b: Reference vs. 50 RECAST forecasts, as heatmaps ───────────────
+from matplotlib.colors import LogNorm
+
+N_FORECASTS = 250
+DAY_BIN, MAG_BIN, KM_BIN = 1.0, 0.25, 20.0   # one time/mag cell is drawn square
+
+with torch.no_grad():
+    ens = model.sample(
+        batch_size       = N_FORECASTS,
+        duration         = forecast_days,
+        t_start          = condition_days,
+        past_seq         = cond_seq,
+        mag_completeness = MC,
+    )
+
+e_t, e_m, e_x, e_y = [], [], [], []
+for i in range(ens.batch_size):
+    keep = ~ens.mask[i].bool()
+    e_t.append(ens.arrival_times[i][keep].numpy())
+    e_m.append(ens.mag[i][keep].numpy())
+    e_x.append(ens.x_loc[i][keep].numpy())
+    e_y.append(ens.y_loc[i][keep].numpy())
+e_t, e_m, e_x, e_y = map(np.concatenate, (e_t, e_m, e_x, e_y))
+
+ref_t, ref_m = seq_ref.arrival_times.numpy(), seq_ref.mag.numpy()
+ref_x, ref_y = seq_ref.x_loc.numpy(), seq_ref.y_loc.numpy()
+ref_cond = ref_t <= condition_days
+
+
+def _msize(m):
+    return 12 * (np.asarray(m) - MC + 1) ** 2
+
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+# Panel 1: magnitude vs. day, mean events per cell per forecast
+t_edges = np.arange(condition_days, float(seq_ref.t_end) + DAY_BIN, DAY_BIN)
+m_edges = np.arange(MC, MAG_MAX + MAG_BIN, MAG_BIN)
+H, _, _ = np.histogram2d(e_t, e_m, bins=[t_edges, m_edges])
+H /= N_FORECASTS
+pm = axes[0].pcolormesh(t_edges, m_edges, np.ma.masked_equal(H, 0).T, cmap='Blues',
+                        norm=LogNorm(vmin=1 / N_FORECASTS, vmax=max(H.max(), 1)))
+fig.colorbar(pm, ax=axes[0], label='Mean events per cell per forecast')
+axes[0].scatter(ref_t, ref_m, s=_msize(ref_m), color='red', zorder=3, label='Reference seq')
+axes[0].axvline(condition_days, color='k', ls='--', label='Condition cutoff')
+axes[0].set_xlim(0, float(seq_ref.t_end))
+axes[0].set_ylim(MC, MAG_MAX)
+axes[0].set_aspect(DAY_BIN / MAG_BIN, adjustable='box')   # cells square on screen
+axes[0].set_xlabel("Days")
+axes[0].set_ylabel("Magnitude")
+axes[0].set_title(f"Forecast density ({N_FORECASTS} samples)")
+axes[0].legend()
+
+# Panel 2: map view, mean events per cell per forecast
+x_edges = np.arange(-HALF_KM_LON, HALF_KM_LON + KM_BIN, KM_BIN)
+y_edges = np.arange(-HALF_KM_LAT, HALF_KM_LAT + KM_BIN, KM_BIN)
+Hxy, _, _ = np.histogram2d(e_x, e_y, bins=[x_edges, y_edges])
+Hxy /= N_FORECASTS
+pm = axes[1].pcolormesh(x_edges, y_edges, np.ma.masked_equal(Hxy, 0).T, cmap='Blues',
+                        norm=LogNorm(vmin=1 / N_FORECASTS, vmax=max(Hxy.max(), 1)))
+fig.colorbar(pm, ax=axes[1], label='Mean events per cell per forecast')
+axes[1].scatter(ref_x[ref_cond], ref_y[ref_cond], s=_msize(ref_m[ref_cond]),
+                color='salmon', alpha=0.6, label='Reference (condition)')
+axes[1].scatter(ref_x[~ref_cond], ref_y[~ref_cond], s=_msize(ref_m[~ref_cond]),
+                color='red', alpha=0.8, label='Reference (forecast period)')
+axes[1].set_xlim(-HALF_KM_LON, HALF_KM_LON)
+axes[1].set_ylim(-HALF_KM_LAT, HALF_KM_LAT)
+axes[1].set_aspect('equal')
+axes[1].set_xlabel("East of box center (km)")
+axes[1].set_ylabel("North of box center (km)")
+axes[1].set_title(f"Forecast density, {KM_BIN:g} km cells")
+axes[1].legend()
+plt.tight_layout()
+plt.savefig(f"{FIGS_DIR}/forecast_heatmaps.png", dpi=150, bbox_inches='tight')
+plt.show()
+
+
+#%%
 # ─── Section 10: Inter-event time distributions ───────────────────────────────
 # Compare the inter-event time density learned by RECAST against the empirical
 # histogram from all training sequences.
@@ -1007,16 +1085,17 @@ for n_train in N_TRAIN_SIZES:
     sweep_nlls.append(nll_sweep)
     print(f"  N_train={n_train:4d}  test NLL={nll_sweep:.4f}")
 
+#%%
 # ── Plot ────────────────────────────────────────────────────────────────────────
 fig, ax = plt.subplots(figsize=(7, 4))
-ax.semilogx(N_TRAIN_SIZES, sweep_nlls, 'o-', color='steelblue',
-            linewidth=1.5, markersize=6, label='RecurrentTPP')
-ax.axhline(etas_test_nll, ls='--', color='darkorange', lw=1.5,
+ax.semilogx(N_TRAIN_SIZES, sweep_nlls, 'o-', color='darkblue',
+            linewidth=1.5, markersize=6, label='RECAST')
+ax.axhline(etas_test_nll, ls='--', color='darkred', lw=1.5,
            label=f'ETAS baseline  ({etas_test_nll:.4f})')
-ax.set_xlabel("Number of training sequences  (log scale)")
+ax.set_xlabel("Number of training sequence")
 ax.set_ylabel("Test NLL / day")
-ax.set_title(f"Data quantity sweep  ({SWEEP_EPOCHS} epochs each)\n"
-             "How much data does RECAST need to match ETAS?")
+#ax.set_title(f"Data quantity sweep  ({SWEEP_EPOCHS} epochs each)\n"
+             #"How much data does RECAST need to match ETAS?")
 ax.legend()
 plt.tight_layout()
 plt.savefig(f"{FIGS_DIR}/data_quantity_sweep.png", dpi=150, bbox_inches='tight')
@@ -1120,11 +1199,72 @@ diff_train = _recast_nll_tr - _etas_nll_tr
 diff_test  = _recast_nll_te - _etas_nll_te
 
 # ── Figure ────────────────────────────────────────────────────────────────────
-fig = plt.figure(figsize=(14, 6))
-gs  = gridspec.GridSpec(2, 2, width_ratios=[2.2, 1], hspace=0.05, wspace=0.38)
-ax_A = fig.add_subplot(gs[0, 0])
-ax_B = fig.add_subplot(gs[1, 0], sharex=ax_A)
-ax_C = fig.add_subplot(gs[:, 1])
+# ── Spatial forecasts for panels D / E ───────────────────────────────────────
+# Both models are conditioned on the first `condition_days` of seq_ref and
+# sampled N_SPATIAL times; the maps show mean events per cell per forecast.
+# etas_2 uses the TRUE generative parameters.  (Evaluating the etas_2
+# conditional intensity on a grid instead would only count first-generation
+# triggering from the conditioning events, not cascades among forecast events,
+# so it would not be comparable to RECAST's sampled maps.)
+from matplotlib.colors import LogNorm
+
+N_SPATIAL, KM_BIN_MAP = 50, 5.0
+_cond_df = cond_seq_to_df(cond_seq)
+_aux_end = T_REF + dt.timedelta(days=condition_days)
+_sim_end = T_REF + dt.timedelta(days=float(seq_ref.t_end))
+
+_rx, _ry = [], []
+with torch.no_grad():
+    _ens = model.sample(batch_size=N_SPATIAL, duration=forecast_days,
+                        t_start=condition_days, past_seq=cond_seq, mag_completeness=MC)
+for i in range(_ens.batch_size):
+    keep = ~_ens.mask[i].bool()
+    _rx.append(_ens.x_loc[i][keep].numpy())
+    _ry.append(_ens.y_loc[i][keep].numpy())
+_rx, _ry = np.concatenate(_rx), np.concatenate(_ry)
+
+_ex, _ey = [], []
+print(f"Simulating {N_SPATIAL} etas_2 continuations …")
+for _ in range(N_SPATIAL):
+    sim = simulate_catalog_continuation(
+        auxiliary_catalog=_cond_df, auxiliary_start=T_REF, auxiliary_end=_aux_end,
+        polygon=polygon, simulation_end=_sim_end, parameters=TRUE_PARAMS,
+        mc=MC, beta_main=beta_main, m_max=MAG_MAX,
+        filter_polygon=False, approx_times=True,
+    )
+    sim = sim[sim['time'] > _aux_end]
+    _ex.append((sim['longitude'].values - LON_CTR) * KM_PER_LON)
+    _ey.append((sim['latitude'].values - LAT_CTR) * KM_PER_LAT)
+_ex, _ey = np.concatenate(_ex), np.concatenate(_ey)
+
+_xe = np.arange(-HALF_KM_LON, HALF_KM_LON + KM_BIN_MAP, KM_BIN_MAP)
+_ye = np.arange(-HALF_KM_LAT, HALF_KM_LAT + KM_BIN_MAP, KM_BIN_MAP)
+_H_recast = np.histogram2d(_rx, _ry, bins=[_xe, _ye])[0] / N_SPATIAL
+_H_etas   = np.histogram2d(_ex, _ey, bins=[_xe, _ye])[0] / N_SPATIAL
+_norm = LogNorm(vmin=1 / N_SPATIAL, vmax=max(_H_recast.max(), _H_etas.max(), 1))
+
+_fore = _arr > condition_days
+_ox, _oy = _seq.x_loc.numpy()[_fore], _seq.y_loc.numpy()[_fore]
+_om = _mags[_fore]
+
+#%%
+fig = plt.figure(figsize=(12, 10))
+
+# ── Manual axes placement: [left, bottom, width, height] in figure fractions ──
+# Edit these numbers to move / resize any panel.
+POS_A  = [0.07, 0.72, 0.52, 0.19]
+POS_B  = [0.07, 0.53, 0.52, 0.19]
+POS_C  = [0.70, 0.53, 0.26, 0.38]
+POS_D  = [0.07, 0.06, 0.45, 0.38]
+POS_E  = [0.40, 0.06, 0.45, 0.38]
+POS_CB = [0.8, 0.07, 0.015, 0.36]
+
+ax_A  = fig.add_axes(POS_A)
+ax_B  = fig.add_axes(POS_B, sharex=ax_A)
+ax_C  = fig.add_axes(POS_C)
+ax_D  = fig.add_axes(POS_D)
+ax_E  = fig.add_axes(POS_E, sharex=ax_D, sharey=ax_D)
+ax_cb = fig.add_axes(POS_CB)
 
 # ── A: magnitude scatter (left axis) + N(t) / Λ(t) (right axis) ──────────────
 ax_A.scatter(_arr, _mags, s=(_mags - MC + 0.5) ** 2 * 12,
@@ -1132,7 +1272,7 @@ ax_A.scatter(_arr, _mags, s=(_mags - MC + 0.5) ** 2 * 12,
 ax_A.set_ylabel("Magnitude")
 ax_A.set_ylim(MC - 0.3, _mags.max() + 0.7)
 plt.setp(ax_A.get_xticklabels(), visible=False)
-ax_A.text(0.01, 0.97, 'A', transform=ax_A.transAxes,
+ax_A.text(0.01, 1.10, 'A', transform=ax_A.transAxes,
           fontsize=12, fontweight='bold', va='top')
 
 ax_A2 = ax_A.twinx()
@@ -1143,6 +1283,7 @@ ax_A2.set_ylabel("Cumulative count / Λ(t)")
 ax_A2.legend(fontsize=8, loc='upper left')
 
 # ── B: conditional intensity λ(t) ─────────────────────────────────────────────
+
 ax_B.plot(_t_fine, etas_int_vals, color='red',   lw=0.9, label='ETAS')
 ax_B.plot(_rt_int, _ri_vals,      color='black', lw=0.9, label='RECAST')
 ax_B.set_yscale('log')
@@ -1179,10 +1320,28 @@ ax_C.text(0, _ymid, ' ETAS : RECAST ', ha='center', va='center',
 ax_C.text(0.01, 0.97, 'C', transform=ax_C.transAxes,
           fontsize=12, fontweight='bold', va='top')
 
+# ── D / E: spatial forecast maps ─────────────────────────────────────────────
+for ax, H, name, letter in [(ax_D, _H_recast, 'RECAST', 'D'),
+                            (ax_E, _H_etas, 'ETAS', 'E')]:
+    pm = ax.pcolormesh(_xe, _ye, np.ma.masked_equal(H, 0).T, cmap='Blues', norm=_norm)
+    ax.scatter(_ox, _oy, s=(_om - MC + 1) ** 2 * 12, facecolor='none',
+               edgecolor='red', lw=0.8, label='Observed (forecast period)')
+    ax.set_xlim(-HALF_KM_LON, HALF_KM_LON)
+    ax.set_ylim(-HALF_KM_LAT, HALF_KM_LAT)
+    ax.set_aspect('equal')
+    ax.set_xlabel("East of box center (km)")
+    ax.set_title(f"{name}\n{N_SPATIAL} forecasts, {KM_BIN_MAP:g} km cells", fontsize=9)
+    ax.text(0.01, 0.97, letter, transform=ax.transAxes,
+            fontsize=12, fontweight='bold', va='top')
+ax_D.set_ylabel("North of box center (km)")
+plt.setp(ax_E.get_yticklabels(), visible=False)
+ax_D.legend(fontsize=8, loc='lower right')
+fig.colorbar(pm, cax=ax_cb, label='Mean events per cell per forecast')
+
 fig.suptitle(
-    "RECAST performance on synthetic ETAS catalogs\n"
-    "(both NLLs: spatio-temporal likelihood of events in the box, per day and per km²)",
-    fontsize=10,
+    "RECAST performance on synthetic ETAS catalogs\n",
+    #"(both NLLs: spatio-temporal likelihood of events in the box, per day and per km²)",
+    fontsize=10, y=0.94,
 )
 plt.savefig(f"{FIGS_DIR}/conditional_intensity.png", dpi=150, bbox_inches='tight')
 plt.show()

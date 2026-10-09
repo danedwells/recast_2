@@ -6,6 +6,7 @@ import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR
 torch.set_num_threads(1)
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 import os
 import shutil
 from plot_helpers import *
@@ -53,8 +54,8 @@ def load_mainshock_sequence(path, ms_lat, ms_lon, mc=4.5, radius_km=250.0):
 
     keep = dist_km <= radius_km
     df   = df[keep].reset_index(drop=True)
-    x_km = x_km[keep] -10
-    y_km = y_km[keep] -10
+    x_km = x_km[keep]
+    y_km = y_km[keep]
 
     # Time: fractional days from first event; 1-hour lead so first inter-time > 0
     t0 = df["time"].iloc[0]
@@ -225,8 +226,8 @@ def collate_with_jitter(sequences, max_km=100.0):
         # Carry all extra fields (mag, mag_bounds, lat, lon, …) through unchanged
         extra = {k: v for k, v in seq.items()
                  if k not in seq.default_sequence_attrs}
-        extra['x_loc'] = seq.x_loc + dx
-        extra['y_loc'] = seq.y_loc + dy
+        extra['x_loc'] = seq.x_loc * 0.25 + dx
+        extra['y_loc'] = seq.y_loc * 0.25 + dy
         jittered.append(eq.data.Sequence(
             seq.inter_times.clone(),
             t_start=seq.t_start,
@@ -269,7 +270,7 @@ if _RETRAIN_:
         running_loss.append(epoch_mean)
         if epoch % 1 == 0:
             print(f"Epoch {epoch:3d}  NLL: {epoch_mean:.4f}")
-        scheduler.step()
+        #scheduler.step()
 
     torch.save(model.state_dict(), f"{SAVE_DIR}/model_anss.pt")
 
@@ -286,6 +287,7 @@ if _RETRAIN_:
 # ─── Load trained model ────────────────────────────────────────────────────────
 map_location = 'cuda' if torch.cuda.is_available() else 'cpu'
 model.load_state_dict(torch.load(f"{SAVE_DIR}/model_anss.pt", map_location=map_location))
+
 
 #%%
 model.eval()
@@ -371,6 +373,76 @@ axes[1].set_xlim([-100, 100])
 axes[1].set_ylim([-100, 100])
 axes[1].axhline(0, color='k', lw=0.5, ls='--')
 axes[1].axvline(0, color='k', lw=0.5, ls='--')
+axes[1].legend()
+plt.tight_layout()
+plt.show()
+
+
+#%%
+# ─── Plot: observed vs. 50 sampled forecasts, as heatmaps ──────────────────────
+N_FORECASTS = 50
+DAY_BIN, MAG_BIN, KM_BIN = 1.0, 0.25, 2.0   # one cell = 1 day wide, 0.25 mag tall (drawn square)
+
+with torch.no_grad():
+    ens_batch = model.sample(
+        batch_size=N_FORECASTS,
+        duration=forecast_days,
+        t_start=condition_days,
+        past_seq=cond_seq,
+        mag_completeness=MAG_MIN,
+    )
+
+e_t, e_m, e_x, e_y = [], [], [], []
+for i in range(ens_batch.batch_size):
+    keep = ~ens_batch.mask[i].bool()
+    e_t.append(ens_batch.arrival_times[i][keep].numpy())
+    e_m.append(ens_batch.mag[i][keep].numpy())
+    e_x.append(ens_batch.x_loc[i][keep].numpy())
+    e_y.append(ens_batch.y_loc[i][keep].numpy())
+e_t, e_m, e_x, e_y = map(np.concatenate, (e_t, e_m, e_x, e_y))
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+
+# Panel 1: magnitude vs. day, mean number of forecast events per cell
+t_edges = np.arange(condition_days, seq.t_end + DAY_BIN, DAY_BIN)
+m_edges = np.arange(2, 8 + MAG_BIN, MAG_BIN)
+H, _, _ = np.histogram2d(e_t, e_m, bins=[t_edges, m_edges])
+H = H / N_FORECASTS
+pm = axes[0].pcolormesh(t_edges, m_edges, np.ma.masked_equal(H, 0).T,
+                        cmap='Blues', norm=LogNorm(vmin=1 / N_FORECASTS, vmax=max(H.max(), 1)))
+fig.colorbar(pm, ax=axes[0], label='Mean events per cell per forecast')
+axes[0].scatter(seq.arrival_times.numpy(), seq.mag.numpy(),
+                s=_msize(seq.mag.numpy()), color='red', zorder=3, label='Observed')
+axes[0].axvline(condition_days, color='k', linestyle='--', label='Condition cutoff')
+axes[0].set_xlim(seq.t_start, seq.t_end)
+axes[0].set_ylim(2, 8)
+axes[0].set_aspect(DAY_BIN / MAG_BIN, adjustable='box')   # cells are square on screen
+axes[0].set_xlabel("Days since mainshock")
+axes[0].set_ylabel("Magnitude")
+axes[0].set_title(f"Forecast density ({N_FORECASTS} samples)")
+axes[0].legend()
+
+# Panel 2: map view, mean number of forecast events per cell
+xy_edges = np.arange(-100, 100 + KM_BIN, KM_BIN)
+Hxy, _, _ = np.histogram2d(e_x, e_y, bins=[xy_edges, xy_edges])
+Hxy = Hxy / N_FORECASTS
+pm = axes[1].pcolormesh(xy_edges, xy_edges, np.ma.masked_equal(Hxy, 0).T,
+                        cmap='Blues', norm=LogNorm(vmin=1 / N_FORECASTS, vmax=max(Hxy.max(), 1)))
+fig.colorbar(pm, ax=axes[1], label='Mean events per cell per forecast')
+axes[1].scatter(seq.x_loc.numpy()[obs_mask_train], seq.y_loc.numpy()[obs_mask_train],
+                s=_msize(obs_mags[obs_mask_train]), color='salmon', alpha=0.6,
+                label='Observed (condition)')
+axes[1].scatter(seq.x_loc.numpy()[~obs_mask_train], seq.y_loc.numpy()[~obs_mask_train],
+                s=_msize(obs_mags[~obs_mask_train]), color='red', alpha=0.8,
+                label='Observed (forecast period)')
+axes[1].set_xlabel("East of mainshock (km)")
+axes[1].set_ylabel("North of mainshock (km)")
+axes[1].set_xlim([-100, 100])
+axes[1].set_ylim([-100, 100])
+axes[1].set_aspect('equal')
+axes[1].axhline(0, color='k', lw=0.5, ls='--')
+axes[1].axvline(0, color='k', lw=0.5, ls='--')
+axes[1].set_title(f"Forecast density, {KM_BIN:g} km cells")
 axes[1].legend()
 plt.tight_layout()
 plt.show()
@@ -765,7 +837,7 @@ ax2.fill_between(t_grid, r_q25, r_q75, alpha=0.38, color='steelblue', zorder=2)
 ax2.step(np.concatenate([[0], t_grid]), np.concatenate([[0], obs_cum]),
          where='post', color='k', linewidth=1.5, zorder=5)
 
-ax.set_xlim(-T_SHOW, T_SHOW)
+ax.set_xlim(-T_SHOW*0.5, T_SHOW)
 ax.set_ylim(MAG_MIN - 0.3, MAG_MAX + 0.3)
 ax.set_xlabel('Time (days)')
 ax.set_ylabel('Magnitude')

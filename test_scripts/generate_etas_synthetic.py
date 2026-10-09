@@ -119,7 +119,7 @@ KM_PER_LAT = 111.1
 KM_PER_LON = KM_PER_LAT * np.cos(np.radians(LAT_CTR))  # ≈ 91.0 km/° at 35°N
 
 # ── Catalog generation settings ─────────────────────────────────────────────────
-N_CATALOGS = 1000    # total number of independent 30-day catalogs to generate
+N_CATALOGS = 10000    # total number of independent 30-day catalogs to generate
 T_DAYS     = 30     # duration of each catalog window [days]
 MC         = 3.0    # magnitude of completeness (catalog lower threshold)
 BETA_MAIN  = np.log(10)  # Gutenberg-Richter β = b × ln(10);  b=1 → β≈2.303
@@ -224,10 +224,13 @@ T_ORIGIN = pd.Timestamp("2000-01-01")   # arbitrary absolute start — only rela
 # guaranteed to have a visible mainshock-aftershock structure.
 print(f"\nGenerating {N_CATALOGS} × {T_DAYS}-day seeded-mainshock catalogs ...")
 for i in range(N_CATALOGS):
-    t_mainshock = T_ORIGIN + pd.Timedelta(days=i * (T_DAYS + 1))
+    # Catalogs are independent and loaded with per-catalog relative times, so they
+    # all start at T_ORIGIN (offsetting by i*(T_DAYS+1) days overflows pandas'
+    # datetime64[ns] range, ~year 2262, past ~3000 catalogs).
+    t_mainshock = T_ORIGIN
     t_sim_end   = t_mainshock + pd.Timedelta(days=T_DAYS)
 
-    ms_mag = float(simulate_magnitudes(1, beta=BETA_MAIN, mc=M_MAINSHOCK_MIN, m_max=8.0)[0])
+    ms_mag = float(simulate_magnitudes(1, beta=BETA_MAIN, mc=M_MAINSHOCK_MIN, m_max=8.5)[0])
     ms_lat = float(np.random.uniform(LAT_MIN, LAT_MAX))
     ms_lon = float(np.random.uniform(LON_MIN, LON_MAX))
 
@@ -296,7 +299,7 @@ meta = {
     "n_catalogs": N_CATALOGS,
     "t_days": T_DAYS,
     "mc": MC,
-    "mag_max": 8.0,          # maximum plausible magnitude (for ContinuousMarks)
+    "mag_max": 8.5,          # maximum plausible magnitude (for ContinuousMarks)
     "richter_b": 1.0,        # b = beta_main / ln(10)
     "random_seed": RANDOM_SEED,
     # RECAST-comparable derived values (for the parameter table in test script)
